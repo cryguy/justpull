@@ -127,6 +127,11 @@ success.
   A digest reference cannot be created with a tag, so after the proxy pull it is
   pulled again by its real name, which costs one manifest request because every
   layer is already in Docker.
+- **All tags.** With `SessionOptions{AllTags: true}` the reference names a
+  repository only and `LocalRef` has no tag, for `docker pull --all-tags`. The
+  proxy relays the repository's tag list page by page with Docker's `n` and
+  `last`; the `Link` to the next page is rewritten to the proxy's own path, so
+  Docker never asks the registry directly.
 - **The proxy** serves only the repository of the pull it belongs to and only
   `GET`/`HEAD`; everything else is `404` or `405`.
 

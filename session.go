@@ -12,7 +12,11 @@ import (
 
 // SessionOptions tunes a Session. The zero value serves the image the
 // reference names.
-type SessionOptions struct{}
+type SessionOptions struct {
+	// AllTags serves every tag of the repository and its tag list, for
+	// docker pull --all-tags. The reference must then name no tag or digest.
+	AllTags bool
+}
 
 // Session is the proxy of one pull without the Docker calls, for a caller
 // that drives Docker itself: Docker pulls LocalRef, the caller tags the
@@ -34,6 +38,9 @@ func (c *Cache) Serve(ctx context.Context, ref string, opts SessionOptions) (*Se
 	if err != nil {
 		return nil, fmt.Errorf("justpull: %w", err)
 	}
+	if opts.AllTags && !t.nameOnly {
+		return nil, fmt.Errorf("justpull: all tags of %s: the reference must name no tag or digest", ref)
+	}
 	if err := c.Sweep(); err != nil {
 		c.opts.Logger.Warn("cache sweep failed", "err", err)
 	}
@@ -41,6 +48,10 @@ func (c *Cache) Serve(ctx context.Context, ref string, opts SessionOptions) (*Se
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("justpull: listen: %w", err)
+	}
+	local := t.localRef(ln.Addr().String())
+	if opts.AllTags {
+		local = ln.Addr().String() + "/" + t.path
 	}
 	sctx, cancel := context.WithCancelCause(ctx)
 	p := newProxy(sctx, c, t, cancel)
@@ -50,7 +61,7 @@ func (c *Cache) Serve(ctx context.Context, ref string, opts SessionOptions) (*Se
 		p:      p,
 		ctx:    sctx,
 		cancel: cancel,
-		local:  t.localRef(ln.Addr().String()),
+		local:  local,
 		srv: &http.Server{
 			Handler:           p,
 			ReadHeaderTimeout: 30 * time.Second,
@@ -61,8 +72,8 @@ func (c *Cache) Serve(ctx context.Context, ref string, opts SessionOptions) (*Se
 	return s, nil
 }
 
-// LocalRef is the reference Docker pulls: 127.0.0.1:<port>/<repository>
-// with the tag or digest of the reference served.
+// LocalRef is the reference Docker pulls: 127.0.0.1:<port>/<repository>,
+// with the tag or digest of the reference served unless AllTags is set.
 func (s *Session) LocalRef() string { return s.local }
 
 // Context ends when a layer fails for good, with that failure as its cause,

@@ -6,19 +6,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-// maxManifestBytes caps a relayed manifest, matching the registry
-// distribution's own limit.
+// maxManifestBytes caps a relayed manifest or tag list page, matching the
+// registry distribution's own limit for manifests.
 const maxManifestBytes = 4 << 20
 
 // proxy serves the pull subset of the registry API for one repository:
-// manifests relayed from the real registry, blobs from the cache. Any other
-// repository is unknown, so the listener is no use to anyone else on the
-// machine.
+// manifests and the tag list relayed from the real registry, blobs from the
+// cache. Any other repository is unknown, so the listener is no use to
+// anyone else on the machine.
 type proxy struct {
 	ctx  context.Context
 	c    *Cache
@@ -61,6 +62,14 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rest, ok := strings.CutPrefix(r.URL.Path, "/v2/")
 	if !ok {
 		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "not found")
+		return
+	}
+	if repo, ok := strings.CutSuffix(rest, "/tags/list"); ok {
+		if repo != p.t.path {
+			writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "repository not served here")
+			return
+		}
+		p.tags(w, r)
 		return
 	}
 	if i := strings.LastIndex(rest, "/manifests/"); i > 0 {
@@ -138,9 +147,83 @@ func (p *proxy) manifest(w http.ResponseWriter, r *http.Request, ref string) {
 	_, _ = w.Write(body)
 }
 
-// refuse fails the pull with the registry's refusal of the manifest, which
-// registryDo could not answer with a login. It must run before the status
-// is relayed: Pull reports this cause only if it is set when Docker gives up.
+// tags relays a page of the repository's tag list, which docker pull
+// --all-tags reads, with the paging query Docker sent.
+func (p *proxy) tags(w http.ResponseWriter, r *http.Request) {
+	resp, err := p.c.up.tags(r.Context(), p.t.scheme, r.Method, p.t.remote, r.URL.RawQuery)
+	if err != nil {
+		if isPermanent(err) {
+			p.fail(err)
+		}
+		writeError(w, http.StatusBadGateway, "UNKNOWN", "registry unreachable: "+err.Error())
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	link := resp.Header.Get("Link")
+	if link != "" {
+		if link, err = p.tagListLink(link); err != nil {
+			writeError(w, http.StatusBadGateway, "UNKNOWN", err.Error())
+			return
+		}
+	}
+	var body []byte
+	if r.Method == http.MethodGet {
+		body, err = io.ReadAll(io.LimitReader(resp.Body, maxManifestBytes+1))
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "UNKNOWN", "reading tag list: "+err.Error())
+			return
+		}
+		if len(body) > maxManifestBytes {
+			writeError(w, http.StatusBadGateway, "UNKNOWN", "tag list larger than 4 MiB")
+			return
+		}
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		p.refuse(resp.Status, body)
+	}
+	if v := resp.Header.Get("Content-Type"); v != "" {
+		w.Header().Set("Content-Type", v)
+	}
+	if link != "" {
+		w.Header().Set("Link", link)
+	}
+	if r.Method == http.MethodHead {
+		if v := resp.Header.Get("Content-Length"); v != "" {
+			w.Header().Set("Content-Length", v)
+		}
+		w.WriteHeader(resp.StatusCode)
+		return
+	}
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+// tagListLink points the registry's Link to the next page of the tag list
+// at the proxy, keeping its query and parameters. dockerd resolves the URL
+// between < and > against the page it asked for, so an absolute URL, which
+// some registries send, would take it to the registry itself.
+func (p *proxy) tagListLink(v string) (string, error) {
+	target, params, hasParams := strings.Cut(v, ";")
+	next, err := url.Parse(strings.Trim(strings.TrimSpace(target), "<>"))
+	if err != nil {
+		return "", fmt.Errorf("registry sent an unusable tag list Link: %w", err)
+	}
+	link := "</v2/" + p.t.path + "/tags/list"
+	if next.RawQuery != "" {
+		link += "?" + next.RawQuery
+	}
+	link += ">"
+	if hasParams {
+		link += ";" + params
+	}
+	return link, nil
+}
+
+// refuse fails the pull with the registry's refusal of a manifest or the tag
+// list, which registryDo could not answer with a login. It must run before
+// the status is relayed: Pull reports this cause only if it is set when
+// Docker gives up.
 func (p *proxy) refuse(status string, body []byte) {
 	msg := strings.TrimSpace(string(body[:min(len(body), 512)]))
 	if msg != "" {

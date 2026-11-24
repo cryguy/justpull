@@ -2,8 +2,11 @@ package justpull
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -73,20 +76,129 @@ func TestSessionFinishKeepsTheFilesOnFailureAndDeletesThemOnSuccess(t *testing.T
 func TestSessionLocalRef(t *testing.T) {
 	c := newPullCache(t, time.Second)
 	digest := "sha256:" + strings.Repeat("a", 64)
-	for ref, want := range map[string]string{
-		"alpine:3.20":                             "library/alpine:3.20",
-		"registry.example.com/team/app":           "team/app:latest",
-		"registry.example.com/team/app@" + digest: "team/app@" + digest,
-	} {
-		s, err := c.Serve(context.Background(), ref, SessionOptions{})
+	cases := []struct {
+		ref     string
+		allTags bool
+		want    string
+	}{
+		{"alpine:3.20", false, "library/alpine:3.20"},
+		{"registry.example.com/team/app", false, "team/app:latest"},
+		{"registry.example.com/team/app@" + digest, false, "team/app@" + digest},
+		{"alpine", true, "library/alpine"},
+		{"registry.example.com/team/app", true, "team/app"},
+	}
+	for _, tc := range cases {
+		s, err := c.Serve(context.Background(), tc.ref, SessionOptions{AllTags: tc.allTags})
 		if err != nil {
 			t.Fatal(err)
 		}
 		local := s.LocalRef()
 		_ = s.Finish(false)
 		host, path, _ := strings.Cut(local, "/")
-		if !strings.HasPrefix(host, "127.0.0.1:") || path != want {
-			t.Errorf("%s: LocalRef = %s, want 127.0.0.1:<port>/%s", ref, local, want)
+		if !strings.HasPrefix(host, "127.0.0.1:") || path != tc.want {
+			t.Errorf("%s (all tags %v): LocalRef = %s, want 127.0.0.1:<port>/%s", tc.ref, tc.allTags, local, tc.want)
 		}
+	}
+}
+
+func TestAllTagsRefusesATagOrDigest(t *testing.T) {
+	c := newPullCache(t, time.Second)
+	for _, ref := range []string{"team/app:latest", "team/app@sha256:" + strings.Repeat("a", 64)} {
+		s, err := c.Serve(context.Background(), ref, SessionOptions{AllTags: true})
+		if err == nil {
+			_ = s.Finish(false)
+			t.Errorf("%s: served all tags of a reference that names one image", ref)
+		}
+	}
+}
+
+func TestTagListIsRelayedPageByPageWithLinksToTheProxy(t *testing.T) {
+	reg := fakereg.New(t)
+	reg.TokenTTL = time.Hour
+	reg.AbsoluteLinks = true
+	for _, tag := range []string{"v2", "v3", "v1"} {
+		reg.AddImage("team/app", tag, 1000)
+	}
+	c := newPullCache(t, 5*time.Second)
+	s, err := c.Serve(context.Background(), reg.Host+"/team/app", SessionOptions{AllTags: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Finish(false) }()
+	host, _, _ := strings.Cut(s.LocalRef(), "/")
+	page, err := url.Parse("http://" + host + "/v2/team/app/tags/list?n=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var tags, links []string
+	for {
+		resp, err := http.Get(page.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Tags []string `json:"tags"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || err != nil {
+			t.Fatalf("GET %s = %s, decode %v", page, resp.Status, err)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("Content-Type = %q", ct)
+		}
+		tags = append(tags, body.Tags...)
+		link := resp.Header.Get("Link")
+		if link == "" {
+			break
+		}
+		links = append(links, link)
+		// As dockerd follows it: the URL between < and >, resolved against
+		// the page it asked for.
+		next, err := url.Parse(strings.Trim(strings.Split(link, ";")[0], "<>"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		page = page.ResolveReference(next)
+	}
+	if want := []string{"v1", "v2", "v3"}; !slices.Equal(tags, want) {
+		t.Fatalf("tags = %v, want %v", tags, want)
+	}
+	if want := []string{`</v2/team/app/tags/list?last=v2&n=2>; rel="next"`}; !slices.Equal(links, want) {
+		t.Fatalf("links = %q, want %q", links, want)
+	}
+
+	req, _ := http.NewRequest(http.MethodHead, "http://"+host+"/v2/team/app/tags/list?n=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if want := `</v2/team/app/tags/list?last=v1&n=1>; rel="next"`; resp.StatusCode != http.StatusOK || resp.Header.Get("Link") != want {
+		t.Fatalf("HEAD = %s with Link %q, want 200 with %q", resp.Status, resp.Header.Get("Link"), want)
+	}
+}
+
+func TestRefusedTagListFailsTheSession(t *testing.T) {
+	reg := privateRegistry(t, time.Hour)
+	c := newPullCache(t, 5*time.Second)
+	s, err := c.Serve(context.Background(), reg.Host+"/team/app", SessionOptions{AllTags: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = s.Finish(false) }()
+	host, _, _ := strings.Cut(s.LocalRef(), "/")
+
+	resp, err := http.Get("http://" + host + "/v2/team/app/tags/list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Fatal("the proxy served a tag list the registry refused")
+	}
+	if cause := context.Cause(s.Context()); !isPermanent(cause) || !strings.Contains(cause.Error(), "refused access to team/app") {
+		t.Fatalf("session cause = %v, want the registry's refusal", cause)
 	}
 }

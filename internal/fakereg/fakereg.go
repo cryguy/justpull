@@ -1,7 +1,7 @@
 // Package fakereg is an in-process OCI registry for tests: images with
-// random layers, optional bearer auth, an optional login (basic, or for the
-// token), optional redirects to a separate storage host whose links expire,
-// and scripted faults on blob GETs.
+// random layers, a paged tag list, optional bearer auth, an optional login
+// (basic, or for the token), optional redirects to a separate storage host
+// whose links expire, and scripted faults on blob GETs.
 package fakereg
 
 import (
@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,6 +101,12 @@ type Registry struct {
 	// RefreshToken, when set, is exchanged for a token by a POST with
 	// grant_type=refresh_token.
 	RefreshToken string
+	// TagsPerPage is the tag list's page size for a request without n;
+	// zero sends every tag at once.
+	TagsPerPage int
+	// AbsoluteLinks makes the tag list's Link to the next page a full URL,
+	// as some registries send, instead of a path.
+	AbsoluteLinks bool
 
 	t       testing.TB
 	srv     *httptest.Server
@@ -250,6 +258,10 @@ func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	rest := strings.TrimPrefix(req.URL.Path, "/v2/")
+	if repo, ok := strings.CutSuffix(rest, "/tags/list"); ok {
+		r.serveTags(w, req, repo)
+		return
+	}
 	if i := strings.LastIndex(rest, "/manifests/"); i > 0 {
 		repo, ref := rest[:i], rest[i+len("/manifests/"):]
 		sep := ":"
@@ -295,6 +307,47 @@ func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	http.NotFound(w, req)
+}
+
+// serveTags answers a page of repo's tag list: the tags after the query's
+// last in sorted order, at most n of them (TagsPerPage without n), with a
+// Link to the next page when more remain.
+func (r *Registry) serveTags(w http.ResponseWriter, req *http.Request, repo string) {
+	var tags []string
+	r.mu.Lock()
+	for key := range r.images {
+		if tag, ok := strings.CutPrefix(key, repo+":"); ok {
+			tags = append(tags, tag)
+		}
+	}
+	r.mu.Unlock()
+	if len(tags) == 0 {
+		http.Error(w, `{"errors":[{"code":"NAME_UNKNOWN"}]}`, http.StatusNotFound)
+		return
+	}
+	slices.Sort(tags)
+	q := req.URL.Query()
+	if last := q.Get("last"); last != "" {
+		tags = slices.DeleteFunc(tags, func(tag string) bool { return tag <= last })
+	}
+	n := r.TagsPerPage
+	if v, err := strconv.Atoi(q.Get("n")); err == nil && v > 0 {
+		n = v
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if n > 0 && len(tags) > n {
+		tags = tags[:n]
+		next := "/v2/" + repo + "/tags/list?" + url.Values{"last": {tags[n-1]}, "n": {strconv.Itoa(n)}}.Encode()
+		if r.AbsoluteLinks {
+			next = r.srv.URL + next
+		}
+		w.Header().Set("Link", "<"+next+`>; rel="next"`)
+	}
+	body, _ := json.Marshal(map[string]any{"name": repo, "tags": tags})
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	if req.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
 }
 
 func (r *Registry) loggedIn(req *http.Request) bool {

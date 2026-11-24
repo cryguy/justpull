@@ -767,6 +767,7 @@ func TestProxyServesOnlyItsRepository(t *testing.T) {
 		"/v2/":                         200,
 		"/v2/other/app/manifests/v1":   404,
 		"/v2/other/app/blobs/sha256:x": 404,
+		"/v2/other/app/tags/list":      404,
 		"/v2/team/app/blobs/sha512:ab": 404,
 		"/nope":                        404,
 	} {

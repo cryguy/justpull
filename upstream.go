@@ -225,13 +225,28 @@ func tokenRequest(ctx context.Context, endpoint *url.URL, service, scope string,
 	return req, nil
 }
 
-// manifest fetches a manifest, retrying network errors and 5xx a few times.
-// The caller relays the response as is.
+// manifest fetches a manifest. The caller relays the response as is.
 func (u *upstream) manifest(ctx context.Context, scheme, method string, r remote, ref string, accept []string) (*http.Response, error) {
 	header := http.Header{}
 	for _, a := range accept {
 		header.Add("Accept", a)
 	}
+	return u.relayed(ctx, method, r.url(scheme, "manifests", ref), header, r)
+}
+
+// tags fetches a page of the repository's tag list; query is the paging
+// query the client sent. The caller relays the response as is.
+func (u *upstream) tags(ctx context.Context, scheme, method string, r remote, query string) (*http.Response, error) {
+	rawURL := r.url(scheme, "tags", "list")
+	if query != "" {
+		rawURL += "?" + query
+	}
+	return u.relayed(ctx, method, rawURL, nil, r)
+}
+
+// relayed sends a request whose answer the proxy relays, retrying network
+// errors and 5xx a few times.
+func (u *upstream) relayed(ctx context.Context, method, rawURL string, header http.Header, r remote) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -243,7 +258,7 @@ func (u *upstream) manifest(ctx context.Context, scheme, method string, r remote
 			case <-t.C:
 			}
 		}
-		resp, err := u.registryDo(ctx, method, r.url(scheme, "manifests", ref), header, r)
+		resp, err := u.registryDo(ctx, method, rawURL, header, r)
 		if err != nil {
 			if isPermanent(err) || ctx.Err() != nil {
 				return nil, err

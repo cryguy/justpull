@@ -51,6 +51,7 @@ type target struct {
 	tag      string
 	digest   string
 	original string // the image's real name, given back after the pull
+	nameOnly bool   // the reference named no tag or digest
 }
 
 func parseRef(ref string) (target, error) {
@@ -63,7 +64,7 @@ func parseRef(ref string) (target, error) {
 	if domain == "docker.io" {
 		host = "registry-1.docker.io"
 	}
-	t := target{remote: remote{host: host, repo: path, registry: domain}, scheme: schemeFor(host), path: path}
+	t := target{remote: remote{host: host, repo: path, registry: domain}, scheme: schemeFor(host), path: path, nameOnly: reference.IsNameOnly(named)}
 	if d, ok := named.(reference.Digested); ok {
 		t.digest = d.Digest().String()
 		t.original = reference.TrimNamed(named).String() + "@" + t.digest
