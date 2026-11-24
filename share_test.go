@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cryguy/justpull/internal/fakedocker"
 	"github.com/cryguy/justpull/internal/fakereg"
 )
 
@@ -382,8 +383,8 @@ func TestConcurrentPullsOfOneImageDownloadEachLayerOnce(t *testing.T) {
 	errs := make(chan error, 2)
 	for range 2 {
 		c := newPullCacheIn(t, dir, Options{StallLimit: 5 * time.Second})
-		d := newFakeDocker()
-		d.afterManifest = barrier
+		d := fakedocker.New()
+		d.AfterManifest = barrier
 		go func() { errs <- c.Pull(ctx, d, reg.Host+"/team/app:v1", nil) }()
 	}
 	for range 2 {

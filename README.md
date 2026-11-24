@@ -145,9 +145,9 @@ The tests need neither Docker nor the network. `internal/fakereg` is an
 in-process registry with expiring tokens, an optional login (Basic, or for the
 token with a password or a refresh token), storage redirects with expiring
 links, and scripted faults per blob request (cut, reset, stall, corruption,
-ignored `Range`, wrong start offset, `401` without a challenge). A fake Docker
-pulls through the proxy the way dockerd does, including skipping manifests and
-layers it already holds.
+ignored `Range`, wrong start offset, `401` without a challenge).
+`internal/fakedocker` pulls through the proxy the way dockerd does, including
+skipping manifests and layers it already holds.
 
 ## License
 

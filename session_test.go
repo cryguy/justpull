@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cryguy/justpull/internal/fakedocker"
 	"github.com/cryguy/justpull/internal/fakereg"
 )
 
@@ -24,7 +25,7 @@ func TestSessionFinishKeepsTheFilesOnFailureAndDeletesThemOnSuccess(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dockerPull(s.Context(), newFakeDocker(), s.LocalRef(), nil, nil); err != nil {
+	if err := dockerPull(s.Context(), fakedocker.New(), s.LocalRef(), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	layer := img.Layers[0]
@@ -57,7 +58,7 @@ func TestSessionFinishKeepsTheFilesOnFailureAndDeletesThemOnSuccess(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dockerPull(s.Context(), newFakeDocker(), s.LocalRef(), nil, nil); err != nil {
+	if err := dockerPull(s.Context(), fakedocker.New(), s.LocalRef(), nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range reg.Log()[before:] {

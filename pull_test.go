@@ -2,232 +2,19 @@ package justpull
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cryguy/justpull/internal/fakedocker"
 	"github.com/cryguy/justpull/internal/fakereg"
 )
-
-// fakeDocker pulls like dockerd: manifest, config, then each layer it does
-// not have, resuming a blob with Range when its body ends early. It writes
-// dockerd's progress stream.
-type fakeDocker struct {
-	client *http.Client
-	// reuseManifests makes it skip the GET for a manifest it already holds
-	// (a HEAD resolves the tag), as the containerd store does.
-	reuseManifests bool
-	// afterManifest, if set, runs between the manifest and the first blob.
-	afterManifest func()
-
-	mu        sync.Mutex
-	have      map[string]bool
-	manifests map[string][]byte
-	blobGets  map[string]int
-	pulls     []string
-	tags      [][2]string
-	untags    []string
-}
-
-func newFakeDocker() *fakeDocker {
-	return &fakeDocker{client: &http.Client{}, have: map[string]bool{}, manifests: map[string][]byte{}, blobGets: map[string]int{}}
-}
-
-func (f *fakeDocker) manifest(ctx context.Context, url string) ([]byte, error) {
-	if f.reuseManifests {
-		req, _ := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
-		req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
-		resp, err := f.client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		_ = resp.Body.Close()
-		f.mu.Lock()
-		raw, ok := f.manifests[resp.Header.Get("Docker-Content-Digest")]
-		f.mu.Unlock()
-		if ok {
-			return raw, nil
-		}
-	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
-	resp, err := f.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	raw, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("manifest: %s: %s", resp.Status, raw)
-	}
-	sum := sha256.Sum256(raw)
-	f.mu.Lock()
-	f.manifests["sha256:"+hex.EncodeToString(sum[:])] = raw
-	f.mu.Unlock()
-	return raw, nil
-}
-
-func (f *fakeDocker) Pull(ctx context.Context, ref string) (io.ReadCloser, error) {
-	f.mu.Lock()
-	f.pulls = append(f.pulls, ref)
-	f.mu.Unlock()
-	pr, pw := io.Pipe()
-	go func() {
-		enc := json.NewEncoder(pw)
-		if err := f.pull(ctx, ref, enc); err != nil {
-			_ = enc.Encode(map[string]string{"error": err.Error()})
-		}
-		_ = pw.Close()
-	}()
-	return pr, nil
-}
-
-func (f *fakeDocker) Tag(_ context.Context, source, target string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.tags = append(f.tags, [2]string{source, target})
-	return nil
-}
-
-func (f *fakeDocker) Untag(_ context.Context, ref string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.untags = append(f.untags, ref)
-	return nil
-}
-
-type streamMsg struct {
-	ID             string         `json:"id,omitempty"`
-	Status         string         `json:"status"`
-	ProgressDetail map[string]any `json:"progressDetail,omitempty"`
-}
-
-func (f *fakeDocker) pull(ctx context.Context, ref string, enc *json.Encoder) error {
-	host, rest, _ := strings.Cut(ref, "/")
-	name, mref := rest, ""
-	if i := strings.Index(rest, "@"); i >= 0 {
-		name, mref = rest[:i], rest[i+1:]
-	} else if i := strings.LastIndex(rest, ":"); i >= 0 {
-		name, mref = rest[:i], rest[i+1:]
-	}
-	base := "http://" + host + "/v2/" + name
-
-	raw, err := f.manifest(ctx, base+"/manifests/"+mref)
-	if err != nil {
-		return err
-	}
-	var m struct {
-		Config struct{ Digest string }   `json:"config"`
-		Layers []struct{ Digest string } `json:"layers"`
-	}
-	if err := json.Unmarshal(raw, &m); err != nil {
-		return err
-	}
-	if f.afterManifest != nil {
-		f.afterManifest()
-	}
-	short := func(d string) string { return strings.TrimPrefix(d, "sha256:")[:12] }
-	_ = enc.Encode(streamMsg{ID: mref, Status: "Pulling from " + name})
-	for _, l := range m.Layers {
-		_ = enc.Encode(streamMsg{ID: short(l.Digest), Status: "Pulling fs layer"})
-	}
-	if err := f.fetchBlob(ctx, base, m.Config.Digest, nil); err != nil {
-		return err
-	}
-	for _, l := range m.Layers {
-		id := short(l.Digest)
-		f.mu.Lock()
-		have := f.have[l.Digest]
-		f.mu.Unlock()
-		if have {
-			_ = enc.Encode(streamMsg{ID: id, Status: "Already exists"})
-			continue
-		}
-		err := f.fetchBlob(ctx, base, l.Digest, func(cur, total int64) {
-			_ = enc.Encode(streamMsg{ID: id, Status: "Downloading", ProgressDetail: map[string]any{"current": cur, "total": total}})
-		})
-		if err != nil {
-			return err
-		}
-		_ = enc.Encode(streamMsg{ID: id, Status: "Download complete"})
-		_ = enc.Encode(streamMsg{ID: id, Status: "Pull complete"})
-	}
-	_ = enc.Encode(streamMsg{Status: "Status: Downloaded newer image for " + ref})
-	return nil
-}
-
-type progressWriter struct {
-	n  int64
-	fn func(int64)
-}
-
-func (p *progressWriter) Write(b []byte) (int, error) {
-	p.n += int64(len(b))
-	if p.fn != nil {
-		p.fn(p.n)
-	}
-	return len(b), nil
-}
-
-func (f *fakeDocker) fetchBlob(ctx context.Context, base, digest string, onProgress func(cur, total int64)) error {
-	h := sha256.New()
-	var got, total int64 = 0, -1
-	for attempt := 0; attempt < 4; attempt++ {
-		f.mu.Lock()
-		f.blobGets[digest]++
-		f.mu.Unlock()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/blobs/"+digest, nil)
-		if got > 0 {
-			req.Header.Set("Range", "bytes="+strconv.FormatInt(got, 10)+"-")
-		}
-		resp, err := f.client.Do(req)
-		if err != nil {
-			return err
-		}
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-			raw, _ := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-			return fmt.Errorf("blob %s: %s: %s", digest[:19], resp.Status, raw)
-		}
-		if total < 0 {
-			total = resp.ContentLength + got
-		}
-		pw := &progressWriter{n: got}
-		if onProgress != nil {
-			pw.fn = func(n int64) { onProgress(n, total) }
-		}
-		n, err := io.Copy(io.MultiWriter(h, pw), resp.Body)
-		_ = resp.Body.Close()
-		got += n
-		if err == nil && got == total {
-			break
-		}
-		if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-			return err
-		}
-	}
-	if sum := "sha256:" + hex.EncodeToString(h.Sum(nil)); sum != digest {
-		return fmt.Errorf("blob %s: digest mismatch", digest[:19])
-	}
-	return nil
-}
-
-func (f *fakeDocker) gets(digest string) int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.blobGets[digest]
-}
 
 func newPullCache(t *testing.T, stall time.Duration) *Cache {
 	t.Helper()
@@ -286,21 +73,21 @@ func TestPullTagsUntagsAndCleansUp(t *testing.T) {
 	reg.Redirect = true
 	img := reg.AddImage("team/app", "v1", 300_000, 200_000)
 	c := newPullCache(t, 5*time.Second)
-	d := newFakeDocker()
+	d := fakedocker.New()
 	var progress []Progress
 
 	err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", func(p Progress) { progress = append(progress, p) })
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(d.pulls) != 1 || !strings.HasPrefix(d.pulls[0], "127.0.0.1:") || !strings.HasSuffix(d.pulls[0], "/team/app:v1") {
-		t.Fatalf("docker pulled %v, want the localhost proxy name", d.pulls)
+	if len(d.Pulls) != 1 || !strings.HasPrefix(d.Pulls[0], "127.0.0.1:") || !strings.HasSuffix(d.Pulls[0], "/team/app:v1") {
+		t.Fatalf("docker pulled %v, want the localhost proxy name", d.Pulls)
 	}
-	if len(d.tags) != 1 || d.tags[0] != [2]string{d.pulls[0], reg.Host + "/team/app:v1"} {
-		t.Fatalf("tags = %v", d.tags)
+	if len(d.Tags) != 1 || d.Tags[0] != [2]string{d.Pulls[0], reg.Host + "/team/app:v1"} {
+		t.Fatalf("tags = %v", d.Tags)
 	}
-	if len(d.untags) != 1 || d.untags[0] != d.pulls[0] {
-		t.Fatalf("untags = %v", d.untags)
+	if len(d.Untags) != 1 || d.Untags[0] != d.Pulls[0] {
+		t.Fatalf("untags = %v", d.Untags)
 	}
 	if files := cacheFiles(t, c); len(files) != 0 {
 		t.Fatalf("cache not emptied: %v", files)
@@ -333,12 +120,12 @@ func TestUpstreamBreaksNeverReachDocker(t *testing.T) {
 			layer := img.Layers[0]
 			layer.Faults(fakereg.Cut, f) // the first break makes the second GET a resume
 			c := newPullCache(t, 5*time.Second)
-			d := newFakeDocker()
+			d := fakedocker.New()
 
 			if err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", nil); err != nil {
 				t.Fatal(err)
 			}
-			if n := d.gets(layer.Digest); n != 1 {
+			if n := d.Gets(layer.Digest); n != 1 {
 				t.Fatalf("docker made %d GETs for the layer, want 1 unbroken GET", n)
 			}
 			reqs := registryBlobRequests(reg, layer.Digest, "registry")
@@ -358,7 +145,7 @@ func TestExpiredStorageLinkIsReplacedFromTheRegistry(t *testing.T) {
 	layer.Faults(fakereg.Stall) // quiet past the link's life; the idle timeout reconnects
 	c := newPullCache(t, 5*time.Second)
 
-	if err := c.Pull(context.Background(), newFakeDocker(), reg.Host+"/team/app:v1", nil); err != nil {
+	if err := c.Pull(context.Background(), fakedocker.New(), reg.Host+"/team/app:v1", nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range registryBlobRequests(reg, layer.Digest, "storage") {
@@ -378,7 +165,7 @@ func TestExpiredTokenMidPullIsRenewed(t *testing.T) {
 	img.Layers[0].Faults(fakereg.Stall)
 	c := newPullCache(t, 5*time.Second)
 
-	if err := c.Pull(context.Background(), newFakeDocker(), reg.Host+"/team/app:v1", nil); err != nil {
+	if err := c.Pull(context.Background(), fakedocker.New(), reg.Host+"/team/app:v1", nil); err != nil {
 		t.Fatal(err)
 	}
 	tokens := 0
@@ -397,13 +184,13 @@ func TestCorruptLayerFailsThePullAndLeavesNoFile(t *testing.T) {
 	img := reg.AddImage("team/app", "v1", 300_000)
 	img.Layers[0].Faults(fakereg.Corrupt)
 	c := newPullCache(t, 5*time.Second)
-	d := newFakeDocker()
+	d := fakedocker.New()
 
 	err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", nil)
 	if err == nil || !strings.Contains(err.Error(), "digest mismatch") {
 		t.Fatalf("err = %v, want a digest mismatch", err)
 	}
-	if len(d.tags) != 0 {
+	if len(d.Tags) != 0 {
 		t.Fatal("a failed pull must not tag")
 	}
 	hexDigest := strings.TrimPrefix(img.Layers[0].Digest, "sha256:")
@@ -425,7 +212,7 @@ func TestFailedPullIsResumedByTheNextPull(t *testing.T) {
 	c := newPullCache(t, 400*time.Millisecond)
 
 	start := time.Now()
-	err := c.Pull(context.Background(), newFakeDocker(), reg.Host+"/team/app:v1", nil)
+	err := c.Pull(context.Background(), fakedocker.New(), reg.Host+"/team/app:v1", nil)
 	if err == nil || !strings.Contains(err.Error(), "no new bytes for 400ms") {
 		t.Fatalf("err = %v, want the stall limit", err)
 	}
@@ -443,7 +230,7 @@ func TestFailedPullIsResumedByTheNextPull(t *testing.T) {
 
 	big.SetBroken(false)
 	before := len(reg.Log())
-	if err := c.Pull(context.Background(), newFakeDocker(), reg.Host+"/team/app:v1", nil); err != nil {
+	if err := c.Pull(context.Background(), fakedocker.New(), reg.Host+"/team/app:v1", nil); err != nil {
 		t.Fatal(err)
 	}
 	var resumed, refetchedSmall bool
@@ -472,19 +259,19 @@ func TestSuccessRemovesCachedLayersDockerSkipped(t *testing.T) {
 	big.Faults(fakereg.Cut)
 	big.SetBroken(true)
 	c := newPullCache(t, 400*time.Millisecond)
-	d := newFakeDocker()
-	d.reuseManifests = true
+	d := fakedocker.New()
+	d.ReuseManifests = true
 	if err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", nil); err == nil {
 		t.Fatal("first pull should fail")
 	}
 
 	big.SetBroken(false)
-	d.have[small.Digest] = true
-	before := d.gets(small.Digest)
+	d.Have[small.Digest] = true
+	before := d.Gets(small.Digest)
 	if err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if d.gets(small.Digest) != before {
+	if d.Gets(small.Digest) != before {
 		t.Fatal("docker asked for a layer it has")
 	}
 	if files := cacheFiles(t, c); len(files) != 0 {
@@ -501,7 +288,7 @@ func TestCancelKeepsThePartial(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
-	err := c.Pull(ctx, newFakeDocker(), reg.Host+"/team/app:v1", nil)
+	err := c.Pull(ctx, fakedocker.New(), reg.Host+"/team/app:v1", nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want the context's error", err)
 	}
@@ -517,7 +304,7 @@ func TestDeniedFailsAtOnce(t *testing.T) {
 	c := newPullCache(t, 10*time.Second)
 
 	start := time.Now()
-	err := c.Pull(context.Background(), newFakeDocker(), reg.Host+"/team/app", nil)
+	err := c.Pull(context.Background(), fakedocker.New(), reg.Host+"/team/app", nil)
 	if err == nil || !strings.Contains(err.Error(), "DENIED") {
 		t.Fatalf("err = %v, want DENIED", err)
 	}
@@ -564,7 +351,7 @@ func (l *credentialLog) names() []string {
 func pullWith(t *testing.T, reg *fakereg.Registry, credentials func(context.Context, string) (Credential, error)) error {
 	t.Helper()
 	c := newPullCacheOpts(t, Options{StallLimit: 10 * time.Second, Credentials: credentials})
-	return c.Pull(context.Background(), newFakeDocker(), reg.Host+"/team/app:v1", nil)
+	return c.Pull(context.Background(), fakedocker.New(), reg.Host+"/team/app:v1", nil)
 }
 
 func TestPullLogsInToAPrivateRegistry(t *testing.T) {
@@ -719,8 +506,8 @@ func TestLayersDockerHasAreNotDownloaded(t *testing.T) {
 	reg := fakereg.New(t)
 	img := reg.AddImage("team/app", "v1", 100_000, 200_000)
 	c := newPullCache(t, 5*time.Second)
-	d := newFakeDocker()
-	d.have[img.Layers[0].Digest] = true
+	d := fakedocker.New()
+	d.Have[img.Layers[0].Digest] = true
 	var last Progress
 
 	if err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", func(p Progress) { last = p }); err != nil {
@@ -738,17 +525,17 @@ func TestDigestReferenceIsPulledAgainInsteadOfTagged(t *testing.T) {
 	reg := fakereg.New(t)
 	img := reg.AddImage("team/app", "v1", 100_000)
 	c := newPullCache(t, 5*time.Second)
-	d := newFakeDocker()
+	d := fakedocker.New()
 	ref := reg.Host + "/team/app@" + img.Digest
 
 	if err := c.Pull(context.Background(), d, ref, nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(d.pulls) != 2 || !strings.HasSuffix(d.pulls[0], "/team/app@"+img.Digest) || d.pulls[1] != ref {
-		t.Fatalf("pulls = %v", d.pulls)
+	if len(d.Pulls) != 2 || !strings.HasSuffix(d.Pulls[0], "/team/app@"+img.Digest) || d.Pulls[1] != ref {
+		t.Fatalf("pulls = %v", d.Pulls)
 	}
-	if len(d.tags) != 0 || len(d.untags) != 1 {
-		t.Fatalf("tags %v untags %v", d.tags, d.untags)
+	if len(d.Tags) != 0 || len(d.Untags) != 1 {
+		t.Fatalf("tags %v untags %v", d.Tags, d.Untags)
 	}
 }
 
