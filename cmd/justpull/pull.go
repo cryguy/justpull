@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -322,7 +323,7 @@ func (p *puller) pull(ctx context.Context, d dockerAPI, local reference.Named, r
 // local name. On a failure the local name stays, holding the image, as the
 // library's Pull leaves it.
 func (p *puller) name(ctx context.Context, d dockerAPI, local reference.Named, cred justpull.Credential) error {
-	var locals []string
+	var locals, users []string
 	switch {
 	case p.opts.all:
 		refs, err := d.ListTags(ctx, local.Name())
@@ -334,22 +335,16 @@ func (p *puller) name(ctx context.Context, d dockerAPI, local reference.Named, c
 			if !ok {
 				continue
 			}
-			if err := d.Tag(ctx, ref, p.named.Name()+":"+tag); err != nil {
+			user := p.named.Name() + ":" + tag
+			if err := d.Tag(ctx, ref, user); err != nil {
 				return err
 			}
-			locals = append(locals, ref)
+			locals, users = append(locals, ref), append(users, user)
 		}
 	case isDigested(local):
 		// A digest reference cannot be created with a tag. Pulling it by its
 		// real name costs one manifest request: every layer is in Docker.
-		same := func(s string) string { return s }
-		rc, err := d.Pull(ctx, p.named.Name(), tagOrDigest(local), p.opts.platform, false, registryAuth(cred, p.registry))
-		if err != nil {
-			return fmt.Errorf("pull %s: %s", p.named.String(), dockerMessage(err, same))
-		}
-		err = newRenderer(io.Discard, false, 0, true, same).render(rc)
-		_ = rc.Close()
-		if err != nil {
+		if err := p.pullByName(ctx, d, tagOrDigest(local), cred); err != nil {
 			return fmt.Errorf("pull %s: %w", p.named.String(), err)
 		}
 		locals = append(locals, local.String())
@@ -357,14 +352,81 @@ func (p *puller) name(ctx context.Context, d dockerAPI, local reference.Named, c
 		if err := d.Tag(ctx, local.String(), p.named.String()); err != nil {
 			return err
 		}
-		locals = append(locals, local.String())
+		locals, users = append(locals, local.String()), append(users, p.named.String())
 	}
+	for _, user := range users {
+		p.recordDigests(ctx, d, local.Name(), user, cred)
+	}
+	// The local name must not outlive the pull, interrupted or not.
 	for _, ref := range locals {
-		if err := d.Untag(ctx, ref); err != nil {
+		if err := d.Untag(context.WithoutCancel(ctx), ref); err != nil {
 			fmt.Fprintf(p.e.stderr, "WARNING: could not remove the image name %s: %v\n", ref, err)
 		}
 	}
 	return nil
+}
+
+// recordDigests gives the image under user the repository digest docker pull
+// records. The containerd store has it from the tag. The graphdriver store
+// records the digest only for the repository pulled, the proxy's, so the
+// image is pulled again by that digest under its real name: one manifest
+// request, every layer being in Docker, and no tag that may have moved since.
+// The image is pulled and named whatever happens here, so a failure is a
+// warning.
+func (p *puller) recordDigests(ctx context.Context, d dockerAPI, localRepo, user string, cred justpull.Credential) {
+	refs, err := d.RepoDigests(ctx, user)
+	if err == nil {
+		for _, digest := range missingDigests(refs, localRepo, p.named.Name()) {
+			if err = p.pullByName(ctx, d, digest, cred); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil && ctx.Err() == nil {
+		fmt.Fprintf(p.e.stderr, "WARNING: %s is pulled, but its repo digest could not be recorded: %v\n", user, err)
+	}
+}
+
+// missingDigests returns the digests recorded for localRepo but not for
+// repo.
+func missingDigests(refs []string, localRepo, repo string) []string {
+	have := map[string]bool{}
+	var local []string
+	for _, ref := range refs {
+		named, err := reference.ParseNormalizedNamed(ref)
+		if err != nil {
+			continue
+		}
+		digested, ok := named.(reference.Digested)
+		if !ok {
+			continue
+		}
+		switch named.Name() {
+		case repo:
+			have[digested.Digest().String()] = true
+		case localRepo:
+			local = append(local, digested.Digest().String())
+		}
+	}
+	var missing []string
+	for _, digest := range local {
+		if !have[digest] && !slices.Contains(missing, digest) {
+			missing = append(missing, digest)
+		}
+	}
+	return missing
+}
+
+// pullByName pulls the user's repository at tagOrDigest straight from its
+// registry, with the login, and prints nothing.
+func (p *puller) pullByName(ctx context.Context, d dockerAPI, tagOrDigest string, cred justpull.Credential) error {
+	same := func(s string) string { return s }
+	rc, err := d.Pull(ctx, p.named.Name(), tagOrDigest, p.opts.platform, false, registryAuth(cred, p.registry))
+	if err != nil {
+		return errors.New(dockerMessage(err, same))
+	}
+	defer func() { _ = rc.Close() }()
+	return newRenderer(io.Discard, false, 0, true, same).render(rc)
 }
 
 // proxyFailed prints the proxy's cause, and how to log in when the registry

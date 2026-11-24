@@ -390,6 +390,27 @@ func TestImageID(t *testing.T) {
 	}
 }
 
+func TestRepoDigests(t *testing.T) {
+	c, last := newFake(t, fake{Stdout: `["alpine@sha256:aa","127.0.0.1:5000/library/alpine@sha256:aa"]` + "\n"})
+	got, err := c.RepoDigests(t.Context(), "alpine:3.20")
+	if want := []string{"alpine@sha256:aa", "127.0.0.1:5000/library/alpine@sha256:aa"}; err != nil || !reflect.DeepEqual(got, want) {
+		t.Errorf("RepoDigests = %q, %v; want %q", got, err, want)
+	}
+	if args := last().Args; !reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{json .RepoDigests}}", "alpine:3.20"}) {
+		t.Errorf("args = %q", args)
+	}
+	for _, out := range []string{"[]\n", "null\n"} {
+		c, _ = newFake(t, fake{Stdout: out})
+		if got, err := c.RepoDigests(t.Context(), "alpine:3.20"); err != nil || len(got) != 0 {
+			t.Errorf("RepoDigests of %q = %q, %v; want none", out, got, err)
+		}
+	}
+	c, _ = newFake(t, fake{Stderr: "Error response from daemon: No such image: alpine:3.20\n", Exit: 1})
+	if _, err := c.RepoDigests(t.Context(), "alpine:3.20"); err == nil {
+		t.Error("RepoDigests of a missing image: no error")
+	}
+}
+
 func TestTagIDs(t *testing.T) {
 	const repo = "127.0.0.1:41234/library/alpine"
 	c, last := newFake(t, fake{Stdout: "3.20\tsha256:aa\n<none>\tsha256:bb\n3.19\tsha256:cc\n"})

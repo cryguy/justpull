@@ -32,6 +32,11 @@ type fakeDocker struct {
 	ids, pulled map[string]string
 	// pullErr, if set, may fail a pull as the daemon's API does.
 	pullErr func(image string) error
+	// digests are the manifest digests the proxy pull got, by tag; store is
+	// the image store RepoDigests answers as: "graphdriver" records a digest
+	// for the repository pulled only, "containerd" for every name too.
+	digests map[string]string
+	store   string
 	// failStart makes the container end at once with this on stderr.
 	failStart string
 
@@ -128,11 +133,41 @@ func (f *fakeDocker) Tag(_ context.Context, source, target string) error {
 	return nil
 }
 
-func (f *fakeDocker) Untag(_ context.Context, ref string) error {
+// Untag fails on an ended ctx, as the docker command it runs is killed.
+func (f *fakeDocker) Untag(ctx context.Context, ref string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.untagged = append(f.untagged, ref)
 	return nil
+}
+
+// RepoDigests answers for the user's names as the store records them: the
+// proxy repository's digest, the name's own on the containerd store, and the
+// name's after a pull of the name by that digest.
+func (f *fakeDocker) RepoDigests(_ context.Context, ref string) ([]string, error) {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	digest, ok := f.digests[tagOrDigest(named)]
+	if !ok || len(f.pulls) == 0 {
+		return nil, nil
+	}
+	refs := []string{f.pulls[0].image + "@" + digest}
+	if f.store == "containerd" {
+		refs = append(refs, named.Name()+"@"+digest)
+	}
+	for _, c := range f.pulls[1:] {
+		if c.image == named.Name() && c.tag == digest {
+			refs = append(refs, c.image+"@"+digest)
+		}
+	}
+	return refs, nil
 }
 
 func (f *fakeDocker) ListTags(_ context.Context, repo string) ([]string, error) {
@@ -320,6 +355,129 @@ func TestPullDigestPullsTheRealNameWithTheLogin(t *testing.T) {
 		t.Fatal("the password was printed")
 	}
 	f.finishSent(t, true)
+}
+
+func TestPullRecordsTheRepoDigestAsDocker(t *testing.T) {
+	for _, tt := range []struct {
+		store     string
+		wantPulls int
+	}{
+		{"graphdriver", 2},
+		{"containerd", 1},
+	} {
+		t.Run(tt.store, func(t *testing.T) {
+			reg := fakereg.New(t)
+			img := reg.AddImage("team/app", "v1", 100_000)
+			f := newFake(t)
+			f.store, f.digests = tt.store, map[string]string{"v1": img.Digest}
+			cfg := &fakeConfig{cred: justpull.Credential{Username: "alice", Password: secret}}
+			ref := reg.Host + "/team/app:v1"
+
+			res := runPull(t, context.Background(), f, cfg, nil, "--platform", "linux/amd64", ref)
+			if res.code != 0 || strings.Contains(res.stderr, "WARNING") || !strings.HasSuffix(res.stdout, "\n"+ref+"\n") {
+				t.Fatalf("exit code %d, stdout %q, stderr %q", res.code, res.stdout, res.stderr)
+			}
+			if len(f.pulls) != tt.wantPulls {
+				t.Fatalf("pulls %+v, want %d", f.pulls, tt.wantPulls)
+			}
+			if tt.wantPulls == 2 {
+				wantAuth := engine.RegistryAuth{Username: "alice", Password: secret, ServerAddress: reg.Host}
+				p := f.pulls[1]
+				if p.image != reg.Host+"/team/app" || p.tag != img.Digest || p.platform != "linux/amd64" || p.allTags || p.auth == nil || *p.auth != wantAuth {
+					t.Fatalf("pull %+v, want the real name by the proxy pull's digest with %+v", p, wantAuth)
+				}
+			}
+			if !slices.Equal(f.untagged, []string{f.proxyRepo(t) + ":v1"}) {
+				t.Fatalf("untagged %q", f.untagged)
+			}
+			f.finishSent(t, true)
+		})
+	}
+}
+
+func TestPullAllTagsRecordsEachRepoDigest(t *testing.T) {
+	reg := fakereg.New(t)
+	v1 := reg.AddImage("team/app", "v1", 100_000)
+	v2 := reg.AddImage("team/app", "v2", 120_000)
+	f := newFake(t)
+	f.tags = []string{"v1", "v2", "same"}
+	f.store, f.digests = "graphdriver", map[string]string{"v1": v1.Digest, "v2": v2.Digest, "same": v1.Digest}
+	name := reg.Host + "/team/app"
+
+	res := runPull(t, context.Background(), f, nil, nil, "-a", name)
+	if res.code != 0 || strings.Contains(res.stderr, "WARNING") {
+		t.Fatalf("exit code %d, stderr %q", res.code, res.stderr)
+	}
+	var got []string
+	for _, p := range f.pulls[1:] {
+		got = append(got, p.image+"@"+p.tag)
+	}
+	if want := []string{name + "@" + v1.Digest, name + "@" + v2.Digest}; !slices.Equal(got, want) {
+		t.Fatalf("pulls after the proxy's %q, want each digest once %q", got, want)
+	}
+}
+
+func TestRepoDigestFailureIsAWarning(t *testing.T) {
+	reg := fakereg.New(t)
+	img := reg.AddImage("team/app", "v1", 100_000)
+	f := newFake(t)
+	f.store, f.digests = "graphdriver", map[string]string{"v1": img.Digest}
+	f.pullErr = func(image string) error {
+		if image != reg.Host+"/team/app" {
+			return nil
+		}
+		return errors.New("net/http: TLS handshake timeout")
+	}
+	ref := reg.Host + "/team/app:v1"
+
+	res := runPull(t, context.Background(), f, nil, nil, ref)
+	want := "WARNING: " + ref + " is pulled, but its repo digest could not be recorded: net/http: TLS handshake timeout\n"
+	if res.code != 0 || !strings.HasSuffix(res.stderr, want) || !strings.HasSuffix(res.stdout, "\n"+ref+"\n") {
+		t.Fatalf("exit code %d, stdout %q, stderr %q; want success with %q", res.code, res.stdout, res.stderr, want)
+	}
+	if len(f.pulls) != 2 || !slices.Equal(f.untagged, []string{f.proxyRepo(t) + ":v1"}) {
+		t.Fatalf("untagged %q", f.untagged)
+	}
+	f.finishSent(t, true)
+}
+
+func TestInterruptWhileRecordingTheDigestRemovesTheLocalName(t *testing.T) {
+	reg := fakereg.New(t)
+	img := reg.AddImage("team/app", "v1", 100_000)
+	f := newFake(t)
+	f.store, f.digests = "graphdriver", map[string]string{"v1": img.Digest}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.pullErr = func(image string) error {
+		if image != reg.Host+"/team/app" {
+			return nil
+		}
+		cancel()
+		return context.Canceled
+	}
+
+	res := runPull(t, ctx, f, nil, nil, reg.Host+"/team/app:v1")
+	if res.code != exitInterrupted || strings.Contains(res.stderr, "WARNING") {
+		t.Fatalf("exit code %d, stderr %q; want no warning", res.code, res.stderr)
+	}
+	if ctx.Err() == nil || len(f.pulls) != 2 || !slices.Equal(f.untagged, []string{f.proxyRepo(t) + ":v1"}) {
+		t.Fatalf("untagged %q, want the local name removed", f.untagged)
+	}
+}
+
+func TestMissingDigests(t *testing.T) {
+	const local = "127.0.0.1:5000/library/alpine"
+	refs := []string{
+		local + "@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		local + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"other/app@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"not a reference",
+	}
+	got := missingDigests(refs, local, "docker.io/library/alpine")
+	if want := []string{"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}; !slices.Equal(got, want) {
+		t.Fatalf("missingDigests = %q, want %q", got, want)
+	}
 }
 
 func TestRegistryAuthNamesDockerHubAsDockerDoes(t *testing.T) {

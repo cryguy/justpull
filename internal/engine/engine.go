@@ -7,6 +7,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -65,6 +66,20 @@ func (c *Client) ImageID(ctx context.Context, ref string) (id string, ok bool, e
 		return "", false, nil
 	}
 	return "", false, err
+}
+
+// RepoDigests returns the repository digests Docker has recorded for the
+// image under ref, as repository@digest in Docker's short form.
+func (c *Client) RepoDigests(ctx context.Context, ref string) ([]string, error) {
+	out, err := c.run(ctx, nil, "image", "inspect", "--format", "{{json .RepoDigests}}", ref)
+	if err != nil {
+		return nil, err
+	}
+	var digests []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &digests); err != nil {
+		return nil, fmt.Errorf("docker image inspect %s: %w", ref, err)
+	}
+	return digests, nil
 }
 
 // TagIDs returns the image ID of each tag Docker has in repo, by tag.
