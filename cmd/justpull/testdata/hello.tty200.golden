@@ -1,0 +1,5 @@
+latest: Pulling from library/hello-world
+
+[1A[2K4f55086f7dd0: Pulling fs layer [1B[1A[2K4f55086f7dd0: Download complete [1B[1A[2K4f55086f7dd0: Pull complete [1B
+[1A[2Kd5e71e642bf5: Download complete [1BDigest: sha256:1e4c05b897a751332ce85c7e9449da2d93514ea2dea6dbb0e2753c9e949b2bfa
+Status: Downloaded newer image for hello-world:latest

@@ -1,0 +1,9 @@
+3.19: Pulling from library/alpine
+
+[1A[2K0a9a5dfd008f: Pulling fs layer [1B
+[1A[2K8a49fdb3b6a5: Pulling fs layer [1B[2A[2K0a9a5dfd008f: Downloading [==============>                                    ]  1.049MB/3.624MB[2B[2A[2K0a9a5dfd008f: Pull complete [2B[1A[2K8a49fdb3b6a5: Pull complete [1BDigest: sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d
+3.20: Pulling from library/alpine
+
+[1A[2K8a49fdb3b6a5: Already exists [1B
+[1A[2Kc3bf32f7e4e2: Pulling fs layer [1B[1A[2Kc3bf32f7e4e2: Pull complete [1BDigest: sha256:0d06d1367effd16dc0d06dbeefdbd8a1da6d2915566fde36db9db0b524eb737f
+Status: Downloaded newer image for alpine

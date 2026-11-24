@@ -1,0 +1,7 @@
+{"status":"Pulling from library/hello-world","id":"latest"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"4f55086f7dd0"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"4f55086f7dd0"}
+{"status":"Pull complete","progressDetail":{"hidecounts":true},"id":"4f55086f7dd0"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"d5e71e642bf5"}
+{"status":"Digest: sha256:1e4c05b897a751332ce85c7e9449da2d93514ea2dea6dbb0e2753c9e949b2bfa"}
+{"status":"Status: Downloaded newer image for 127.0.0.1:41234/library/hello-world:latest"}

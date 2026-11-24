@@ -1,0 +1,18 @@
+{"status":"Pulling from library/alpine","id":"3.20"}
+{"status":"Already exists","progressDetail":{},"id":"0a9a5dfd008f"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"c3bf32f7e4e2"}
+{"status":"Waiting","progressDetail":{},"id":"c3bf32f7e4e2"}
+{"status":"Downloading","progressDetail":{"current":1048576,"total":3623807},"progress":"[==============>                                    ]  1.049MB/3.624MB","id":"8a49fdb3b6a5"}
+{"status":"Downloading","progressDetail":{"current":3623807,"total":3623807},"progress":"[==================================================>]  3.624MB/3.624MB","id":"8a49fdb3b6a5"}
+{"status":"Verifying Checksum","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Download complete","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Downloading","progressDetail":{"current":512},"id":"c3bf32f7e4e2"}
+{"status":"Downloading","progressDetail":{"current":999950,"total":999949},"id":"c3bf32f7e4e2"}
+{"status":"Extracting","progressDetail":{"current":65536,"total":3623807},"progress":"[>                                                  ]  65.54kB/3.624MB","id":"8a49fdb3b6a5"}
+{"status":"Extracting","progressDetail":{"current":3623807,"total":3623807},"id":"8a49fdb3b6a5"}
+{"status":"Pull complete","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"c3bf32f7e4e2"}
+{"status":"Pull complete","progressDetail":{},"id":"c3bf32f7e4e2"}
+{"status":"Digest: sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d"}
+{"status":"Status: Downloaded newer image for 127.0.0.1:41234/library/alpine:3.20"}

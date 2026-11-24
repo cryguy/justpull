@@ -1,0 +1,6 @@
+{"status":"Pulling from library/alpine","id":"3.20"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"c3bf32f7e4e2"}
+{"status":"Downloading","progressDetail":{"current":1048576,"total":3623807},"id":"8a49fdb3b6a5"}
+{"errorDetail":{"message":"failed to register layer of 127.0.0.1:41234/library/alpine:3.20: unexpected EOF"},"error":"failed to register layer of 127.0.0.1:41234/library/alpine:3.20: unexpected EOF"}
+{"status":"Status: Downloaded newer image for 127.0.0.1:41234/library/alpine:3.20"}

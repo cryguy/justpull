@@ -1,0 +1,13 @@
+{"status":"Pulling from library/alpine","id":"3.19"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"0a9a5dfd008f"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Downloading","progressDetail":{"current":1048576,"total":3623807},"id":"0a9a5dfd008f"}
+{"status":"Pull complete","progressDetail":{},"id":"0a9a5dfd008f"}
+{"status":"Pull complete","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Digest: sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d"}
+{"status":"Pulling from library/alpine","id":"3.20"}
+{"status":"Already exists","progressDetail":{},"id":"8a49fdb3b6a5"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"c3bf32f7e4e2"}
+{"status":"Pull complete","progressDetail":{},"id":"c3bf32f7e4e2"}
+{"status":"Digest: sha256:0d06d1367effd16dc0d06dbeefdbd8a1da6d2915566fde36db9db0b524eb737f"}
+{"status":"Status: Downloaded newer image for 127.0.0.1:41234/library/alpine"}

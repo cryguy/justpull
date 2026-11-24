@@ -1,0 +1,2 @@
+# The goldens are docker's output byte for byte; no line ending conversion.
+* -text
