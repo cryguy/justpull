@@ -1,0 +1,4 @@
+*
+!dist/proxy/justpull-linux-amd64
+!dist/proxy/justpull-linux-arm64
+!dist/rootfs/cache

@@ -1,0 +1,10 @@
+# The proxy image ghcr.io/cryguy/justpull:<version>, which a CLI built without
+# the embedded proxy pulls. Its filesystem and config are those of the image
+# internal/proxyimage imports from the embedded binary; change both together.
+# Build it from the repository root after scripts/build.sh.
+FROM scratch
+ARG TARGETARCH
+COPY --chown=65534:65534 --chmod=0755 dist/rootfs/cache/ /cache/
+COPY --chmod=0755 dist/proxy/justpull-linux-${TARGETARCH} /justpull
+USER 65534:65534
+ENTRYPOINT ["/justpull"]

@@ -92,7 +92,8 @@ func importBinary(ctx context.Context, d docker, ref, arch string, gzipped []byt
 // rootfs returns the image's filesystem as a tar: the proxy at /justpull and
 // an empty /cache owned by nobody. A fresh named volume mounted on /cache
 // takes the directory's owner, so the proxy, running as nobody, can write
-// its cache there.
+// its cache there. Dockerfile.proxy builds the published image with the same
+// filesystem and changes; keep the two alike.
 func rootfs(binary []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
