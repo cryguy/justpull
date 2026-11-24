@@ -28,6 +28,7 @@ const (
 	defaultIdleTimeout = 30 * time.Second
 	defaultRetryBase   = time.Second
 	defaultRetryMax    = 30 * time.Second
+	defaultFollowPoll  = 200 * time.Millisecond
 
 	chunkSize = 256 << 10
 )
@@ -55,27 +56,39 @@ type Options struct {
 // download broken by the network, a failed pull or a restart continues where
 // it stopped. Layout: <dir>/blobs/sha256/<hex> once verified,
 // <hex>.partial while downloading; <dir>/manifests/sha256/<hex> for the
-// manifests relayed, which name an image's blobs for cleanup.
+// manifests relayed, which name an image's blobs for cleanup;
+// <dir>/locks/sha256/<hex>.dl and <hex>.use, the flock(2) files that
+// coordinate the processes sharing the directory.
 //
-// One Cache should own a directory; its methods are safe for concurrent use.
+// Several processes, or several Caches, may share a directory. A blob is
+// downloaded by one of them at a time; the others stream it from the cache
+// file as it arrives, and one of them takes the download over from what is on
+// disk if its downloader dies or gives up. Cleanup and Sweep skip blobs
+// another process uses. Unix only (Linux, macOS, the BSDs): New fails
+// elsewhere. A Cache's methods are safe for concurrent use.
 type Cache struct {
 	dir  string // blobs
 	mdir string // manifests
+	ldir string // locks
 	opts Options
 
 	// Fixed by New; tests shorten them.
 	idleTimeout time.Duration
 	retryBase   time.Duration
 	retryMax    time.Duration
+	followPoll  time.Duration
 
 	up *upstream
 
 	mu    sync.Mutex
-	blobs map[string]*blob // blobs held by a request or a running download
+	blobs map[string]*blob // blobs held by a request, a pin or a running download
 }
 
 // New opens (creating if needed) a cache rooted at dir.
 func New(dir string, opts Options) (*Cache, error) {
+	if !flockSupported {
+		return nil, errors.New("justpull: the cache shares its directory through flock(2), which this system lacks; it runs on Linux, macOS and the BSDs")
+	}
 	if opts.StallLimit <= 0 {
 		opts.StallLimit = DefaultStallLimit
 	}
@@ -87,7 +100,8 @@ func New(dir string, opts Options) (*Cache, error) {
 	}
 	bdir := filepath.Join(dir, "blobs", "sha256")
 	mdir := filepath.Join(dir, "manifests", "sha256")
-	for _, d := range []string{bdir, mdir} {
+	ldir := filepath.Join(dir, "locks", "sha256")
+	for _, d := range []string{bdir, mdir, ldir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return nil, fmt.Errorf("justpull: create cache dir: %w", err)
 		}
@@ -95,13 +109,19 @@ func New(dir string, opts Options) (*Cache, error) {
 	return &Cache{
 		dir:         bdir,
 		mdir:        mdir,
+		ldir:        ldir,
 		opts:        opts,
 		idleTimeout: defaultIdleTimeout,
 		retryBase:   defaultRetryBase,
 		retryMax:    defaultRetryMax,
+		followPoll:  defaultFollowPoll,
 		up:          newUpstream(opts.Credentials),
 		blobs:       map[string]*blob{},
 	}, nil
+}
+
+func (c *Cache) lockPath(hexDigest, kind string) string {
+	return filepath.Join(c.ldir, hexDigest+kind)
 }
 
 // fetchFunc opens a blob's bytes from offset on. start is where the body
@@ -112,6 +132,7 @@ type fetchFunc func(ctx context.Context, offset int64) (body io.ReadCloser, star
 type blob struct {
 	hex string
 	dir string
+	use *os.File // shared lock on <hex>.use while the Cache holds the blob
 
 	mu       sync.Mutex
 	changed  chan struct{} // closed and replaced on every state change
@@ -140,12 +161,18 @@ func (b *blob) update(f func()) {
 
 // acquire returns the blob with one more reference. size, if positive, is
 // the size a manifest gave for it.
-func (c *Cache) acquire(hexDigest string, size int64) *blob {
+func (c *Cache) acquire(hexDigest string, size int64) (*blob, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	b := c.blobs[hexDigest]
 	if b == nil {
-		b = &blob{hex: hexDigest, dir: c.dir, size: -1, changed: make(chan struct{})}
+		// Taken before the files are looked at: from then on no other
+		// process deletes them.
+		use, err := lockShared(c.lockPath(hexDigest, ".use"))
+		if err != nil {
+			return nil, fmt.Errorf("lock layer sha256:%s: %w", hexDigest[:12], err)
+		}
+		b = &blob{hex: hexDigest, dir: c.dir, use: use, size: -1, changed: make(chan struct{})}
 		if fi, err := os.Stat(b.completePath()); err == nil {
 			b.size, b.written, b.verified = fi.Size(), fi.Size(), true
 		}
@@ -157,7 +184,7 @@ func (c *Cache) acquire(hexDigest string, size int64) *blob {
 		b.size = size
 	}
 	b.mu.Unlock()
-	return b
+	return b, nil
 }
 
 func (c *Cache) release(b *blob) {
@@ -167,8 +194,15 @@ func (c *Cache) release(b *blob) {
 	defer b.mu.Unlock()
 	b.refs--
 	if b.refs == 0 && !b.running {
-		delete(c.blobs, b.hex)
+		c.dropLocked(b)
 	}
+}
+
+// dropLocked forgets a blob nothing holds any more, which lets other
+// processes delete it. The caller holds c.mu and b.mu.
+func (c *Cache) dropLocked(b *blob) {
+	delete(c.blobs, b.hex)
+	_ = b.use.Close()
 }
 
 // ensureDownload starts the blob's download unless it is verified, failed in
@@ -185,7 +219,7 @@ func (c *Cache) ensureDownload(ctx context.Context, b *blob, fetch fetchFunc, on
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		err := c.download(ctx, b, fetch)
+		err := c.fill(ctx, b, fetch)
 		c.mu.Lock()
 		b.mu.Lock()
 		b.running = false
@@ -194,7 +228,7 @@ func (c *Cache) ensureDownload(ctx context.Context, b *blob, fetch fetchFunc, on
 		}
 		b.notifyLocked()
 		if b.refs == 0 {
-			delete(c.blobs, b.hex)
+			c.dropLocked(b)
 		}
 		b.mu.Unlock()
 		c.mu.Unlock()
@@ -202,6 +236,105 @@ func (c *Cache) ensureDownload(ctx context.Context, b *blob, fetch fetchFunc, on
 			onFail(fmt.Errorf("layer sha256:%s: %w", b.hex[:12], err))
 		}
 	}()
+}
+
+// errFollowedDeleted means the partial file streamed from another process's
+// download was deleted, which only a digest mismatch does.
+var errFollowedDeleted = permanent(errors.New("digest mismatch in another process's download of the layer; the bytes already served are bad"))
+
+// fill ends with the blob's complete file on disk. Only the holder of the
+// blob's download lock fetches it. Every other process follows the holder's
+// partial file, so its readers get the bytes as they land, and takes the
+// lock over when the holder stops without finishing; download then resumes
+// from the bytes on disk.
+func (c *Cache) fill(ctx context.Context, b *blob, fetch fetchFunc) error {
+	// followed is the partial file this blob has been served from. Those
+	// bytes are good only if that same file is finished or taken over; a
+	// rename keeps the file, a deletion and a fresh download do not.
+	var followed os.FileInfo
+	most, lastProgress := int64(-1), time.Now()
+	for {
+		if done, err := finished(b, followed); done || err != nil {
+			return err
+		}
+		dl, err := tryLockExclusive(c.lockPath(b.hex, ".dl"))
+		if err == nil {
+			err = c.downloadLocked(ctx, b, fetch, followed)
+			_ = dl.Close()
+			return err
+		}
+		if !errors.Is(err, errLocked) {
+			return permanent(fmt.Errorf("lock layer download: %w", err))
+		}
+
+		info, err := os.Stat(b.partialPath())
+		switch {
+		case err == nil && followed != nil && !os.SameFile(followed, info):
+			return errFollowedDeleted
+		case err == nil:
+			followed = info
+			n := info.Size()
+			b.mu.Lock()
+			if b.written != n {
+				b.written = n
+				b.notifyLocked()
+			}
+			b.mu.Unlock()
+			if n > most {
+				most, lastProgress = n, time.Now()
+			}
+		case followed != nil && errors.Is(err, os.ErrNotExist):
+			// Renamed to the complete name since that was looked at, or
+			// deleted.
+			if done, err := finished(b, followed); done || err != nil {
+				return err
+			}
+			return errFollowedDeleted
+		}
+		if time.Since(lastProgress) >= c.opts.StallLimit {
+			return fmt.Errorf("no new bytes for %s", c.opts.StallLimit)
+		}
+		t := time.NewTimer(c.followPoll)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+}
+
+// downloadLocked runs with the blob's download lock held, so no other
+// process changes its files meanwhile.
+func (c *Cache) downloadLocked(ctx context.Context, b *blob, fetch fetchFunc, followed os.FileInfo) error {
+	if done, err := finished(b, followed); done || err != nil {
+		return err
+	}
+	if followed != nil {
+		info, err := os.Stat(b.partialPath())
+		if errors.Is(err, os.ErrNotExist) || (err == nil && !os.SameFile(followed, info)) {
+			return errFollowedDeleted
+		}
+		if err != nil {
+			return permanent(fmt.Errorf("partial file: %w", err))
+		}
+	}
+	return c.download(ctx, b, fetch)
+}
+
+// finished marks the blob verified if its complete file exists. A complete
+// file other than the partial file followed is a download that started over
+// after that one was deleted.
+func finished(b *blob, followed os.FileInfo) (bool, error) {
+	info, err := os.Stat(b.completePath())
+	if err != nil {
+		return false, nil
+	}
+	if followed != nil && !os.SameFile(followed, info) {
+		return false, errFollowedDeleted
+	}
+	b.update(func() { b.size, b.written, b.verified = info.Size(), info.Size(), true })
+	return true, nil
 }
 
 // download fills the blob's partial file from the registry, resuming from
@@ -474,21 +607,52 @@ func openBlobFile(b *blob, verified bool) (*os.File, error) {
 }
 
 // Sweep deletes cached files that have not been written for MaxAge and are
-// not in use. Pull runs it first; a long-running caller should also run it
-// periodically so a cancelled pull's files go even when no new pull comes.
+// not in use by this or another process, and the lock files of blobs whose
+// files are gone. Pull runs it first; a long-running caller should also run
+// it periodically so a cancelled pull's files go even when no new pull comes.
 func (c *Cache) Sweep() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	cutoff := time.Now().Add(-c.opts.MaxAge)
-	return errors.Join(
-		sweepDir(c.dir, cutoff, func(name string) bool {
-			hexDigest := strings.TrimSuffix(name, ".partial")
-			return isHexDigest(hexDigest) && c.blobs[hexDigest] == nil
-		}),
-		sweepDir(c.mdir, cutoff, func(name string) bool {
-			return isHexDigest(name) || strings.HasPrefix(name, ".tmp-")
-		}),
-	)
+	stale := map[string]bool{}
+	errs := []error{
+		staleDigests(c.dir, []string{"", ".partial"}, cutoff, stale),
+		staleDigests(c.ldir, []string{".dl", ".use"}, cutoff, stale),
+	}
+	old := func(path string) bool {
+		info, err := os.Stat(path)
+		return err == nil && info.ModTime().Before(cutoff)
+	}
+	for hexDigest := range stale {
+		if c.blobs[hexDigest] == nil {
+			errs = append(errs, c.removeBlobLocked(hexDigest, old))
+		}
+	}
+	errs = append(errs, sweepDir(c.mdir, cutoff, func(name string) bool {
+		return isHexDigest(name) || strings.HasPrefix(name, ".tmp-")
+	}))
+	return errors.Join(errs...)
+}
+
+// staleDigests adds to out the digest of every file in dir named <hex> and
+// one of suffixes that was last written before cutoff.
+func staleDigests(dir string, suffixes []string, cutoff time.Time, out map[string]bool) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("justpull: sweep: %w", err)
+	}
+	for _, e := range entries {
+		for _, suffix := range suffixes {
+			hexDigest, ok := strings.CutSuffix(e.Name(), suffix)
+			if !ok || !isHexDigest(hexDigest) {
+				continue
+			}
+			if info, err := e.Info(); err == nil && info.ModTime().Before(cutoff) {
+				out[hexDigest] = true
+			}
+		}
+	}
+	return nil
 }
 
 // sweepDir deletes the files in dir that ours accepts and that were last
@@ -558,6 +722,9 @@ func (c *Cache) loadManifest(hexDigest string) ([]byte, bool) {
 	return body, hex.EncodeToString(sum[:]) == hexDigest
 }
 
+// removeManifests deletes saved manifests. They are not locked, so another
+// process pulling the same image may lose its copy; that pull then knows
+// fewer of its blobs for sizes, pins and cleanup, and still completes.
 func (c *Cache) removeManifests(hexDigests []string) error {
 	var errs []error
 	for _, hexDigest := range hexDigests {
@@ -568,8 +735,8 @@ func (c *Cache) removeManifests(hexDigests []string) error {
 	return errors.Join(errs...)
 }
 
-// removeBlobs deletes the files of the given blobs that no request or
-// download is using.
+// removeBlobs deletes the files of the given blobs that no request, pin or
+// download of this or another process is using.
 func (c *Cache) removeBlobs(hexDigests []string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -578,10 +745,48 @@ func (c *Cache) removeBlobs(hexDigests []string) error {
 		if c.blobs[hexDigest] != nil {
 			continue
 		}
-		for _, name := range []string{hexDigest, hexDigest + ".partial"} {
-			if err := os.Remove(filepath.Join(c.dir, name)); err != nil && !errors.Is(err, os.ErrNotExist) {
-				errs = append(errs, err)
+		errs = append(errs, c.removeBlobLocked(hexDigest, func(string) bool { return true }))
+	}
+	return errors.Join(errs...)
+}
+
+// removeBlobLocked deletes the blob's files that del accepts, and its lock
+// files once no blob file is left, unless another process holds the blob.
+// The caller holds c.mu and has checked that this Cache does not.
+func (c *Cache) removeBlobLocked(hexDigest string, del func(path string) bool) error {
+	use, err := tryLockExclusive(c.lockPath(hexDigest, ".use"))
+	if errors.Is(err, errLocked) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock layer sha256:%s: %w", hexDigest[:12], err)
+	}
+	defer func() { _ = use.Close() }()
+
+	var errs []error
+	left := false
+	for _, name := range []string{hexDigest, hexDigest + ".partial"} {
+		path := filepath.Join(c.dir, name)
+		if !del(path) {
+			if _, err := os.Lstat(path); err == nil {
+				left = true
 			}
+			continue
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+			left = true
+		}
+	}
+	if left {
+		return errors.Join(errs...)
+	}
+	// Unlinked while held, so anyone who opened them earlier finds them gone
+	// once it gets the lock. The download lock goes first: once .use is
+	// unlinked, a newcomer locks a new one and must not find the old .dl.
+	for _, kind := range []string{".dl", ".use"} {
+		if err := os.Remove(c.lockPath(hexDigest, kind)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)

@@ -28,6 +28,8 @@ type fakeDocker struct {
 	// reuseManifests makes it skip the GET for a manifest it already holds
 	// (a HEAD resolves the tag), as the containerd store does.
 	reuseManifests bool
+	// afterManifest, if set, runs between the manifest and the first blob.
+	afterManifest func()
 
 	mu        sync.Mutex
 	have      map[string]bool
@@ -132,6 +134,9 @@ func (f *fakeDocker) pull(ctx context.Context, ref string, enc *json.Encoder) er
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return err
 	}
+	if f.afterManifest != nil {
+		f.afterManifest()
+	}
 	short := func(d string) string { return strings.TrimPrefix(d, "sha256:")[:12] }
 	_ = enc.Encode(streamMsg{ID: mref, Status: "Pulling from " + name})
 	for _, l := range m.Layers {
@@ -231,22 +236,28 @@ func newPullCache(t *testing.T, stall time.Duration) *Cache {
 
 func newPullCacheOpts(t *testing.T, opts Options) *Cache {
 	t.Helper()
-	c, err := New(t.TempDir(), opts)
+	return newPullCacheIn(t, t.TempDir(), opts)
+}
+
+func newPullCacheIn(t *testing.T, dir string, opts Options) *Cache {
+	t.Helper()
+	c, err := New(dir, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.idleTimeout = 200 * time.Millisecond
 	c.retryBase = 10 * time.Millisecond
 	c.retryMax = 50 * time.Millisecond
+	c.followPoll = 10 * time.Millisecond
 	return c
 }
 
-// cacheFiles lists the blob files by name and the saved manifests as
-// "m/<name>".
+// cacheFiles lists the blob files by name, the saved manifests as
+// "m/<name>" and the lock files as "l/<name>".
 func cacheFiles(t *testing.T, c *Cache) map[string]int64 {
 	t.Helper()
 	out := map[string]int64{}
-	for prefix, dir := range map[string]string{"": c.dir, "m/": c.mdir} {
+	for prefix, dir := range map[string]string{"": c.dir, "m/": c.mdir, "l/": c.ldir} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatal(err)

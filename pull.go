@@ -146,6 +146,7 @@ func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Pr
 				_ = srv.Close()
 			}
 			p.wg.Wait()
+			p.unpin()
 		})
 	}
 	defer stop()

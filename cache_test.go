@@ -18,14 +18,31 @@ import (
 
 func newTestCache(t *testing.T, stall time.Duration) *Cache {
 	t.Helper()
-	c, err := New(t.TempDir(), Options{StallLimit: stall, MaxAge: time.Hour})
+	return newTestCacheIn(t, t.TempDir(), stall)
+}
+
+// newTestCacheIn opens a cache on dir; two of them on one dir stand for two
+// processes sharing it.
+func newTestCacheIn(t *testing.T, dir string, stall time.Duration) *Cache {
+	t.Helper()
+	c, err := New(dir, Options{StallLimit: stall, MaxAge: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
 	c.idleTimeout = 200 * time.Millisecond
 	c.retryBase = 10 * time.Millisecond
 	c.retryMax = 50 * time.Millisecond
+	c.followPoll = 10 * time.Millisecond
 	return c
+}
+
+func mustAcquire(t *testing.T, c *Cache, digest string, size int64) *blob {
+	t.Helper()
+	b, err := c.acquire(digest, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func randomBlob(t *testing.T, size int) ([]byte, string) {
@@ -106,10 +123,22 @@ func runDownload(t *testing.T, c *Cache, digest string, size int64, fetch fetchF
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	var buf bytes.Buffer
+	r := serveBlob(ctx, c, digest, size, fetch, &buf)
+	r.got = buf.Bytes()
+	return r
+}
+
+// serveBlob is runDownload writing to w, for a test that runs it in the
+// background or watches what the reader gets as it arrives.
+func serveBlob(ctx context.Context, c *Cache, digest string, size int64, fetch fetchFunc, w io.Writer) result {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var failErr error
-	b := c.acquire(digest, size)
+	b, err := c.acquire(digest, size)
+	if err != nil {
+		return result{err: err}
+	}
 	defer c.release(b)
 	c.ensureDownload(ctx, b, fetch, func(err error) {
 		mu.Lock()
@@ -118,14 +147,13 @@ func runDownload(t *testing.T, c *Cache, digest string, size int64, fetch fetchF
 	}, &wg)
 
 	n, err := b.waitSize(ctx)
-	var buf bytes.Buffer
 	if err == nil {
-		err = b.serve(ctx, &buf, func() {}, 0, n-1)
+		err = b.serve(ctx, w, func() {}, 0, n-1)
 	}
 	wg.Wait()
 	mu.Lock()
 	defer mu.Unlock()
-	return result{got: buf.Bytes(), err: err, failErr: failErr}
+	return result{err: err, failErr: failErr}
 }
 
 func fileExists(path string) bool {
@@ -355,7 +383,7 @@ func TestServeHonoursARange(t *testing.T) {
 	f := &fakeFetch{attempt: func(_ int, off int64) (io.ReadCloser, int64, int64, error) { return whole(data, off) }}
 	runDownload(t, c, digest, -1, f.fetch)
 
-	b := c.acquire(digest, -1)
+	b := mustAcquire(t, c, digest, -1)
 	defer c.release(b)
 	var buf bytes.Buffer
 	if err := b.serve(context.Background(), &buf, func() {}, 1000, 1999); err != nil {
@@ -388,7 +416,7 @@ func TestSweepDeletesOnlyOldUnusedFiles(t *testing.T) {
 			}
 		}
 	}
-	b := c.acquire(name('d'), -1)
+	b := mustAcquire(t, c, name('d'), -1)
 	defer c.release(b)
 
 	if err := c.Sweep(); err != nil {
@@ -444,7 +472,7 @@ func TestRemoveBlobsSkipsBlobsInUse(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	b := c.acquire(busy, -1)
+	b := mustAcquire(t, c, busy, -1)
 	defer c.release(b)
 
 	if err := c.removeBlobs([]string{free, busy}); err != nil {

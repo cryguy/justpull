@@ -30,6 +30,8 @@ type proxy struct {
 	sizes     map[string]int64 // hex digest -> size, from this image's manifests
 	touched   map[string]bool  // blobs Docker asked for
 	manifests map[string]bool  // this image's manifests
+	pins      map[string]*blob // this image's blobs, held until the pull ends; nil while being acquired
+	unpinned  bool
 }
 
 func newProxy(ctx context.Context, c *Cache, t target, cancel context.CancelCauseFunc) *proxy {
@@ -41,6 +43,7 @@ func newProxy(ctx context.Context, c *Cache, t target, cancel context.CancelCaus
 		sizes:     map[string]int64{},
 		touched:   map[string]bool{},
 		manifests: map[string]bool{},
+		pins:      map[string]*blob{},
 	}
 }
 
@@ -148,8 +151,8 @@ func (p *proxy) refuse(status string, body []byte) {
 
 // recordManifest notes a manifest as part of this pull's image along with
 // the blob sizes it lists, so downloads can be checked against them and the
-// image's files found for cleanup. An index's children are followed if a
-// copy of them was saved.
+// image's files found for cleanup, and pins those blobs. An index's children
+// are followed if a copy of them was saved.
 func (p *proxy) recordManifest(hexDigest string, manifest []byte, depth int) {
 	type descriptor struct {
 		Digest string `json:"digest"`
@@ -167,6 +170,7 @@ func (p *proxy) recordManifest(hexDigest string, manifest []byte, depth int) {
 	if m.Config != nil {
 		descs = append(descs, *m.Config)
 	}
+	pin := map[string]int64{}
 	p.mu.Lock()
 	if hexDigest != "" {
 		p.manifests[hexDigest] = true
@@ -174,9 +178,16 @@ func (p *proxy) recordManifest(hexDigest string, manifest []byte, depth int) {
 	for _, d := range descs {
 		if h, ok := strings.CutPrefix(d.Digest, "sha256:"); ok && isHexDigest(h) && d.Size > 0 {
 			p.sizes[h] = d.Size
+			if _, held := p.pins[h]; !held && !p.unpinned {
+				p.pins[h] = nil
+				pin[h] = d.Size
+			}
 		}
 	}
 	p.mu.Unlock()
+	for h, size := range pin {
+		p.pin(h, size)
+	}
 	if depth > 0 {
 		return
 	}
@@ -187,6 +198,39 @@ func (p *proxy) recordManifest(hexDigest string, manifest []byte, depth int) {
 		}
 		if body, found := p.c.loadManifest(h); found {
 			p.recordManifest(h, body, depth+1)
+		}
+	}
+}
+
+// pin holds a blob of the image in the cache until the pull ends, so another
+// process's cleanup cannot delete it between Docker's requests.
+func (p *proxy) pin(hexDigest string, size int64) {
+	b, err := p.c.acquire(hexDigest, size)
+	if err != nil {
+		p.fail(err)
+		return
+	}
+	p.mu.Lock()
+	if p.unpinned {
+		// The pull ended while this handler ran on: a server that does not
+		// shut down in time is closed without waiting for its handlers.
+		p.mu.Unlock()
+		p.c.release(b)
+		return
+	}
+	p.pins[hexDigest] = b
+	p.mu.Unlock()
+}
+
+// unpin releases every pin; pins asked for later are released at once.
+func (p *proxy) unpin() {
+	p.mu.Lock()
+	pins := p.pins
+	p.pins, p.unpinned = nil, true
+	p.mu.Unlock()
+	for _, b := range pins {
+		if b != nil {
+			p.c.release(b)
 		}
 	}
 }
@@ -237,7 +281,12 @@ func (p *proxy) blob(w http.ResponseWriter, r *http.Request, digest string) {
 	size := p.sizes[hexDigest]
 	p.mu.Unlock()
 
-	b := p.c.acquire(hexDigest, size)
+	b, err := p.c.acquire(hexDigest, size)
+	if err != nil {
+		p.fail(err)
+		writeError(w, http.StatusInternalServerError, "UNKNOWN", err.Error())
+		return
+	}
 	defer p.c.release(b)
 	fetch := func(ctx context.Context, offset int64) (io.ReadCloser, int64, int64, error) {
 		return p.c.up.openBlob(ctx, p.t.scheme, p.t.remote, digest, offset)

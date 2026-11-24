@@ -17,3 +17,6 @@ func isPermanent(err error) bool {
 
 // errRangeNotSatisfiable means the registry refused our resume offset.
 var errRangeNotSatisfiable = errors.New("registry refused the resume offset")
+
+// errLocked means another process, or another Cache, holds a lock.
+var errLocked = errors.New("lock held elsewhere")

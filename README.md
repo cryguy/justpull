@@ -95,6 +95,15 @@ justpull.Options{Credentials: func(ctx context.Context, registry string) (justpu
   blobs and the saved manifests alike. On failure or cancel they stay, and the
   next `Pull` of an image sharing those layers continues from them. `Sweep`
   deletes files not written for 24 hours (`Options.MaxAge`).
+- **Shared cache.** Several processes, or several `Cache` values, may use one
+  directory at once. A layer is downloaded once: the other pulls stream it to
+  their Docker from the cache file as it arrives, and if the downloading
+  process dies or gives up, one of them takes the download over from the bytes
+  on disk. If that download fails its digest check, the pulls streaming it fail
+  too, since their Docker already got the bad bytes. Cleanup after a pull and
+  `Sweep` skip layers another process is using. The processes coordinate with
+  `flock(2)` on files in `<dir>/locks/sha256/`, so this needs Unix (Linux,
+  macOS, the BSDs); elsewhere `New` fails.
 - **Disk.** While a pull runs, the image's compressed layers are on disk twice:
   in the cache and in Docker.
 - **Auth.** `Options.Credentials` is asked only when a registry answers `401`
