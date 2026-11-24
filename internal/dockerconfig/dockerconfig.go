@@ -1,5 +1,5 @@
 // Package dockerconfig finds the registry login the docker CLI would use, from
-// its config file and its credential helpers.
+// DOCKER_AUTH_CONFIG, its config file and its credential helpers.
 package dockerconfig
 
 import (
@@ -39,11 +39,26 @@ const (
 	notFoundMessage = "credentials not found in native keychain"
 )
 
-// Config is the login part of the docker CLI's config.json.
+// envKey names the variable whose logins the docker CLI puts in front of the
+// config file's: {"auths":{"<address>":{"auth":"<base64 user:password>"}}}.
+const envKey = "DOCKER_AUTH_CONFIG"
+
+// Config is the login part of the docker CLI's config.json, and of
+// DOCKER_AUTH_CONFIG.
 type Config struct {
 	auths       map[string]authEntry
 	credsStore  string
 	credHelpers map[string]string
+	env         map[string]justpull.Credential
+	envErr      error
+}
+
+type envFile struct {
+	Auths map[string]envEntry `json:"auths"`
+}
+
+type envEntry struct {
+	Auth string `json:"auth"`
 }
 
 type configFile struct {
@@ -65,7 +80,8 @@ type helperOutput struct {
 }
 
 // Load reads the docker CLI's config: $DOCKER_CONFIG/config.json, else
-// ~/.docker/config.json. A missing file is an empty config.
+// ~/.docker/config.json. A missing file is an empty config. A malformed
+// DOCKER_AUTH_CONFIG is reported by Credential.
 func Load() (*Config, error) {
 	dir := os.Getenv("DOCKER_CONFIG")
 	if dir == "" {
@@ -75,7 +91,40 @@ func Load() (*Config, error) {
 		}
 		dir = filepath.Join(home, ".docker")
 	}
-	return load(filepath.Join(dir, "config.json"))
+	c, err := load(filepath.Join(dir, "config.json"))
+	if err != nil {
+		return nil, err
+	}
+	if v := os.Getenv(envKey); v != "" {
+		c.env, c.envErr = parseEnv(v)
+	}
+	return c, nil
+}
+
+// parseEnv reads DOCKER_AUTH_CONFIG. Its errors never quote the value.
+func parseEnv(v string) (map[string]justpull.Credential, error) {
+	var f envFile
+	dec := json.NewDecoder(strings.NewReader(v))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
+		return nil, errors.New(envKey + ` is not JSON of the form {"auths":{"<registry>":{"auth":"<base64 user:password>"}}}`)
+	}
+	if dec.More() {
+		return nil, errors.New(envKey + " holds more than one JSON object")
+	}
+	creds := make(map[string]justpull.Credential, len(f.Auths))
+	for _, addr := range slices.Sorted(maps.Keys(f.Auths)) {
+		auth := f.Auths[addr].Auth
+		if auth == "" {
+			return nil, fmt.Errorf("%s has no auth for %s", envKey, addr)
+		}
+		username, password, err := decodeAuth(auth)
+		if err != nil {
+			return nil, fmt.Errorf("%s: the auth for %s %w", envKey, addr, err)
+		}
+		creds[addr] = justpull.Credential{Username: username, Password: password}
+	}
+	return creds, nil
 }
 
 func homeDir() (string, error) {
@@ -142,6 +191,12 @@ func platformStore() string {
 // Credential and a nil error.
 func (c *Config) Credential(ctx context.Context, registry string) (justpull.Credential, error) {
 	addr := serverAddress(registry)
+	if c.envErr != nil {
+		return justpull.Credential{}, c.envErr
+	}
+	if cred, ok := c.env[addr]; ok {
+		return cred, nil
+	}
 	helper, ok := c.credHelpers[addr]
 	if !ok {
 		helper = c.credsStore
@@ -179,17 +234,27 @@ func (c *Config) fromAuths(addr, registry string) (justpull.Credential, error) {
 	if e.Auth == "" {
 		return cred, nil
 	}
-	decoded, err := base64.StdEncoding.DecodeString(e.Auth)
+	username, password, err := decodeAuth(e.Auth)
 	if err != nil {
-		return justpull.Credential{}, fmt.Errorf("docker config: the auth of the %s login is not base64", registry)
+		return justpull.Credential{}, fmt.Errorf("docker config: the auth of the %s login %w", registry, err)
+	}
+	cred.Username = username
+	cred.Password = password
+	return cred, nil
+}
+
+// decodeAuth splits an auth field, base64 of user:password. Its errors never
+// quote the field.
+func decodeAuth(auth string) (username, password string, err error) {
+	decoded, err := base64.StdEncoding.DecodeString(auth)
+	if err != nil {
+		return "", "", errors.New("is not base64")
 	}
 	username, password, found := strings.Cut(string(decoded), ":")
 	if !found || username == "" {
-		return justpull.Credential{}, fmt.Errorf("docker config: the auth of the %s login is not user:password", registry)
+		return "", "", errors.New("is not user:password")
 	}
-	cred.Username = username
-	cred.Password = strings.Trim(password, "\x00")
-	return cred, nil
+	return username, strings.Trim(password, "\x00"), nil
 }
 
 // hostname turns an auths key written as a URL, such as https://ghcr.io or

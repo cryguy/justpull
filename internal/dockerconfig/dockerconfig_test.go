@@ -14,6 +14,11 @@ import (
 	"github.com/cryguy/justpull"
 )
 
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("DOCKER_AUTH_CONFIG")
+	os.Exit(m.Run())
+}
+
 // echoHelper answers with a login whose username names the helper and the
 // address it was asked for.
 func echoHelper(tag string) string {
@@ -321,6 +326,106 @@ func TestPlatformStoreWhenTheConfigNamesNoLogin(t *testing.T) {
 	writeConfig(t, `{"auths":{"quay.io":{}}}`)
 	if got := mustCredential(t, "ghcr.io"); got != (justpull.Credential{}) {
 		t.Fatalf("a config with auths: got %+v, want no login", got)
+	}
+}
+
+func envConfig(auths map[string]string) string {
+	var b strings.Builder
+	b.WriteString(`{"auths":{`)
+	first := true
+	for addr, auth := range auths {
+		if !first {
+			b.WriteString(",")
+		}
+		first = false
+		b.WriteString(`"` + addr + `":{"auth":"` + auth + `"}`)
+	}
+	b.WriteString(`}}`)
+	return b.String()
+}
+
+func TestAuthConfigEnvWins(t *testing.T) {
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "one", echoHelper("one"))
+	writeHelper(t, dir, "store", echoHelper("store"))
+	writeConfig(t, `{"credHelpers":{"ghcr.io":"one"},"auths":{"quay.io":{"auth":"`+basic("file", "pw-file")+`"}}}`)
+	t.Setenv("DOCKER_AUTH_CONFIG", envConfig(map[string]string{
+		"ghcr.io":                     basic("env-ghcr", "pw:1"),
+		"quay.io":                     basic("env-quay", "pw2"),
+		"https://index.docker.io/v1/": basic("env-hub", "pw3"),
+	}))
+	cases := map[string]justpull.Credential{
+		"ghcr.io":   {Username: "env-ghcr", Password: "pw:1"},
+		"quay.io":   {Username: "env-quay", Password: "pw2"},
+		"docker.io": {Username: "env-hub", Password: "pw3"},
+	}
+	for registry, want := range cases {
+		if got := mustCredential(t, registry); got != want {
+			t.Errorf("%s: got %+v, want %+v", registry, got, want)
+		}
+	}
+
+	writeConfig(t, `{"credsStore":"store"}`)
+	if got := mustCredential(t, "ghcr.io"); got.Username != "env-ghcr" {
+		t.Errorf("credsStore: got %+v, want the env's login", got)
+	}
+}
+
+func TestAuthConfigEnvFallsBack(t *testing.T) {
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "one", echoHelper("one"))
+	writeConfig(t, `{"credHelpers":{"ghcr.io":"one"},"auths":{"quay.io":{"auth":"`+basic("file", "pw-file")+`"}}}`)
+	// The env's keys match exactly: https://ghcr.io is not ghcr.io there.
+	t.Setenv("DOCKER_AUTH_CONFIG", envConfig(map[string]string{
+		"https://ghcr.io":  basic("env-ghcr", "pw"),
+		"registry.example": basic("env-example", "pw"),
+	}))
+	if got := mustCredential(t, "ghcr.io"); got.Username != "one@ghcr.io" {
+		t.Errorf("ghcr.io: got %+v, want the helper's login", got)
+	}
+	if got, want := mustCredential(t, "quay.io"), (justpull.Credential{Username: "file", Password: "pw-file"}); got != want {
+		t.Errorf("quay.io: got %+v, want %+v", got, want)
+	}
+
+	for _, env := range []string{`{"auths":{}}`, `{}`, "  "} {
+		t.Setenv("DOCKER_AUTH_CONFIG", env)
+		if got := mustCredential(t, "ghcr.io"); got.Username != "one@ghcr.io" {
+			t.Errorf("env %q: got %+v, want the helper's login", env, got)
+		}
+	}
+}
+
+func TestMalformedAuthConfigEnvIsAnErrorWithoutTheValue(t *testing.T) {
+	writeConfig(t, `{"auths":{"ghcr.io":{"auth":"`+basic("file", "pw-file")+`"}}}`)
+	secret := basic("user", "hunter2")
+	cases := map[string]string{
+		"not JSON":           `{"auths":{"ghcr.io":{"auth":"` + secret + `"`,
+		"syntax error":       `{"auths":{"ghcr.io":{"auth":"` + secret + `" hunter2}}}`,
+		"wrong type":         `{"auths":{"ghcr.io":{"auth":12345}}}`,
+		"unknown field":      `{"auths":{"ghcr.io":{"auth":"` + secret + `","password":"hunter2"}}}`,
+		"two objects":        `{"auths":{"ghcr.io":{"auth":"` + secret + `"}}} {"hunter2":1}`,
+		"no auth":            `{"auths":{"ghcr.io":{}}}`,
+		"auth not base64":    `{"auths":{"ghcr.io":{"auth":"hunter2!!"}}}`,
+		"auth without colon": `{"auths":{"ghcr.io":{"auth":"` + base64.StdEncoding.EncodeToString([]byte("hunter2")) + `"}}}`,
+		"another registry":   `{"auths":{"ghcr.io":{"auth":"` + secret + `"},"quay.io":{"auth":"hunter2!!"}}}`,
+	}
+	for name, env := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("DOCKER_AUTH_CONFIG", env)
+			_, err := credential(t, "ghcr.io")
+			if err == nil {
+				t.Fatal("no error")
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "DOCKER_AUTH_CONFIG") {
+				t.Fatalf("the error does not name DOCKER_AUTH_CONFIG: %v", msg)
+			}
+			for _, leak := range []string{"hunter2", secret, "12345", "aHVudGVyMg", "'h'", "'u'"} {
+				if strings.Contains(msg, leak) {
+					t.Fatalf("the error quotes %q: %v", leak, msg)
+				}
+			}
+		})
 	}
 }
 
