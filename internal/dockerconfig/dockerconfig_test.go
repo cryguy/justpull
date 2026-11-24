@@ -1,0 +1,343 @@
+package dockerconfig
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/cryguy/justpull"
+)
+
+// echoHelper answers with a login whose username names the helper and the
+// address it was asked for.
+func echoHelper(tag string) string {
+	return `[ "$1" = get ] || exit 3
+read -r addr || true
+printf '{"ServerURL":"%s","Username":"` + tag + `@%s","Secret":"pw-` + tag + `"}' "$addr" "$addr"
+`
+}
+
+// writeConfig points DOCKER_CONFIG at a new directory holding config.
+func writeConfig(t *testing.T, config string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_CONFIG", dir)
+}
+
+// helperDir puts a new directory first on PATH, or alone on it, and returns
+// it.
+func helperDir(t *testing.T, alone bool) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake credential helpers are shell scripts")
+	}
+	dir := t.TempDir()
+	path := dir
+	if !alone {
+		path += string(os.PathListSeparator) + os.Getenv("PATH")
+	}
+	t.Setenv("PATH", path)
+	return dir
+}
+
+func writeHelper(t *testing.T, dir, name, script string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "docker-credential-"+name), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func credential(t *testing.T, registry string) (justpull.Credential, error) {
+	t.Helper()
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c.Credential(context.Background(), registry)
+}
+
+func mustCredential(t *testing.T, registry string) justpull.Credential {
+	t.Helper()
+	cred, err := credential(t, registry)
+	if err != nil {
+		t.Fatalf("Credential(%q): %v", registry, err)
+	}
+	return cred
+}
+
+func basic(user, password string) string {
+	return base64.StdEncoding.EncodeToString([]byte(user + ":" + password))
+}
+
+func TestLookupOrder(t *testing.T) {
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "one", echoHelper("one"))
+	writeHelper(t, dir, "store", echoHelper("store"))
+	fromFile := justpull.Credential{Username: "file", Password: "pw-file"}
+
+	cases := []struct {
+		name     string
+		config   string
+		registry string
+		want     justpull.Credential
+	}{
+		{
+			name:     "credHelpers beats credsStore and auths",
+			config:   `{"credHelpers":{"ghcr.io":"one"},"credsStore":"store","auths":{"ghcr.io":{"auth":"` + basic("file", "pw-file") + `"}}}`,
+			registry: "ghcr.io",
+			want:     justpull.Credential{Username: "one@ghcr.io", Password: "pw-one"},
+		},
+		{
+			name:     "credsStore beats auths",
+			config:   `{"credHelpers":{"ghcr.io":"one"},"credsStore":"store","auths":{"quay.io":{"auth":"` + basic("file", "pw-file") + `"}}}`,
+			registry: "quay.io",
+			want:     justpull.Credential{Username: "store@quay.io", Password: "pw-store"},
+		},
+		{
+			name:     "auths when no helper is named",
+			config:   `{"credHelpers":{"ghcr.io":"one"},"auths":{"quay.io":{"auth":"` + basic("file", "pw-file") + `"}}}`,
+			registry: "quay.io",
+			want:     fromFile,
+		},
+		{
+			name:     "an empty credHelpers entry means the file",
+			config:   `{"credHelpers":{"quay.io":""},"credsStore":"store","auths":{"quay.io":{"auth":"` + basic("file", "pw-file") + `"}}}`,
+			registry: "quay.io",
+			want:     fromFile,
+		},
+		{
+			name:     "localhost with a port",
+			config:   `{"credHelpers":{"localhost:5000":"one"}}`,
+			registry: "localhost:5000",
+			want:     justpull.Credential{Username: "one@localhost:5000", Password: "pw-one"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, tc.config)
+			if got := mustCredential(t, tc.registry); got != tc.want {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDockerHubKey(t *testing.T) {
+	writeConfig(t, `{"auths":{"https://index.docker.io/v1/":{"auth":"`+basic("hubuser", "hubpw")+`"}}}`)
+	want := justpull.Credential{Username: "hubuser", Password: "hubpw"}
+	for _, registry := range []string{"docker.io", "index.docker.io"} {
+		if got := mustCredential(t, registry); got != want {
+			t.Errorf("%s: got %+v, want %+v", registry, got, want)
+		}
+	}
+	// The docker CLI keys registry-1.docker.io by its own name.
+	if got := mustCredential(t, "registry-1.docker.io"); got != (justpull.Credential{}) {
+		t.Errorf("registry-1.docker.io: got %+v, want no login", got)
+	}
+
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "store", echoHelper("store"))
+	writeConfig(t, `{"credsStore":"store"}`)
+	if got := mustCredential(t, "docker.io"); got.Username != "store@https://index.docker.io/v1/" {
+		t.Errorf("the helper was asked for %q, want the Hub key", strings.TrimPrefix(got.Username, "store@"))
+	}
+
+	writeConfig(t, `{"credHelpers":{"https://index.docker.io/v1/":"one"}}`)
+	writeHelper(t, dir, "one", echoHelper("one"))
+	if got := mustCredential(t, "docker.io"); got.Username != "one@https://index.docker.io/v1/" {
+		t.Errorf("credHelpers under the Hub key: got %+v", got)
+	}
+}
+
+func TestAuthsEntries(t *testing.T) {
+	cases := []struct {
+		name  string
+		entry string
+		want  justpull.Credential
+	}{
+		{"auth", `{"auth":"` + basic("user", "pa:ss") + `"}`, justpull.Credential{Username: "user", Password: "pa:ss"}},
+		{"auth beats legacy fields", `{"auth":"` + basic("user", "pw") + `","username":"old","password":"oldpw"}`, justpull.Credential{Username: "user", Password: "pw"}},
+		{"legacy username and password", `{"username":"user","password":"pw"}`, justpull.Credential{Username: "user", Password: "pw"}},
+		{"identitytoken", `{"auth":"` + basic("user", "") + `","identitytoken":"refresh"}`, justpull.Credential{Username: "user", IdentityToken: "refresh"}},
+		{"empty entry", `{}`, justpull.Credential{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			writeConfig(t, `{"auths":{"ghcr.io":`+tc.entry+`}}`)
+			if got := mustCredential(t, "ghcr.io"); got != tc.want {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAuthsKeysWithSchemeAndPath(t *testing.T) {
+	cases := []struct {
+		key, registry string
+	}{
+		{"https://ghcr.io", "ghcr.io"},
+		{"https://ghcr.io/v2/", "ghcr.io"},
+		{"http://localhost:5000/v2/", "localhost:5000"},
+		{"registry.example.com/v1/", "registry.example.com"},
+		{"https://[::1]:5000/", "[::1]:5000"},
+		{"http://::1:5000/v2/", "[::1]:5000"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.key, func(t *testing.T) {
+			writeConfig(t, `{"auths":{"`+tc.key+`":{"auth":"`+basic("user", "pw")+`"}}}`)
+			want := justpull.Credential{Username: "user", Password: "pw"}
+			if got := mustCredential(t, tc.registry); got != want {
+				t.Fatalf("%s: got %+v, want %+v", tc.registry, got, want)
+			}
+		})
+	}
+	writeConfig(t, `{"auths":{"https://ghcr.io":{"auth":"`+basic("user", "pw")+`"}}}`)
+	if got := mustCredential(t, "quay.io"); got != (justpull.Credential{}) {
+		t.Fatalf("another registry got %+v", got)
+	}
+}
+
+func TestBadAuthIsAnErrorWithoutTheValue(t *testing.T) {
+	for _, auth := range []string{"not*base64secret", base64.StdEncoding.EncodeToString([]byte("nocolonsecret"))} {
+		writeConfig(t, `{"auths":{"ghcr.io":{"auth":"`+auth+`"}}}`)
+		_, err := credential(t, "ghcr.io")
+		if err == nil {
+			t.Fatalf("auth %q: no error", auth)
+		}
+		if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), auth) {
+			t.Fatalf("the error quotes the auth: %v", err)
+		}
+	}
+}
+
+func TestHelperNotFoundIsNoLogin(t *testing.T) {
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "store", `echo "credentials not found in native keychain"; exit 1`)
+	writeConfig(t, `{"credsStore":"store","auths":{"ghcr.io":{"auth":"`+basic("file", "pw")+`"}}}`)
+	if got := mustCredential(t, "ghcr.io"); got != (justpull.Credential{}) {
+		t.Fatalf("got %+v, want no login", got)
+	}
+}
+
+func TestHelperTokenIsIdentityToken(t *testing.T) {
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "store", `printf '{"ServerURL":"ghcr.io","Username":"<token>","Secret":"refresh"}'`)
+	writeConfig(t, `{"credsStore":"store"}`)
+	want := justpull.Credential{IdentityToken: "refresh"}
+	if got := mustCredential(t, "ghcr.io"); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
+
+func TestHelperFailureNeverQuotesTheSecret(t *testing.T) {
+	dir := helperDir(t, false)
+	writeHelper(t, dir, "fails", `printf '{"Username":"u","Secret":"hunter2"}'; echo hunter2 >&2; exit 1`)
+	writeHelper(t, dir, "garbled", `printf 'hunter2'`)
+	for _, helper := range []string{"fails", "garbled"} {
+		writeConfig(t, `{"credsStore":"`+helper+`"}`)
+		_, err := credential(t, "ghcr.io")
+		if err == nil {
+			t.Fatalf("%s: no error", helper)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "hunter2") || strings.Contains(msg, "'h'") {
+			t.Fatalf("%s: the error quotes the helper's output: %v", helper, msg)
+		}
+		if !strings.Contains(msg, "docker-credential-"+helper) || !strings.Contains(msg, "ghcr.io") {
+			t.Fatalf("%s: the error does not name the helper and the registry: %v", helper, msg)
+		}
+	}
+}
+
+func TestMissingHelperIsAnError(t *testing.T) {
+	helperDir(t, true)
+	writeConfig(t, `{"credHelpers":{"ghcr.io":"absent"}}`)
+	_, err := credential(t, "ghcr.io")
+	if err == nil || !strings.Contains(err.Error(), "docker-credential-absent") || !strings.Contains(err.Error(), "ghcr.io") {
+		t.Fatalf("got %v, want an error naming the helper and the registry", err)
+	}
+}
+
+func TestCancelStopsAHangingHelper(t *testing.T) {
+	dir := helperDir(t, false)
+	// sleep runs as the shell's child, so it keeps stdout open after the
+	// shell is killed.
+	writeHelper(t, dir, "hangs", `sleep 30`)
+	writeConfig(t, `{"credsStore":"hangs"}`)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(200*time.Millisecond, cancel)
+	start := time.Now()
+	_, err = c.Credential(ctx, "ghcr.io")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want context.Canceled", err)
+	}
+	if took := time.Since(start); took > 5*time.Second {
+		t.Fatalf("Credential returned %s after the cancel", took)
+	}
+}
+
+func TestNoConfigIsNoLogin(t *testing.T) {
+	helperDir(t, true)
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	if got := mustCredential(t, "ghcr.io"); got != (justpull.Credential{}) {
+		t.Fatalf("missing file: got %+v", got)
+	}
+	writeConfig(t, ``)
+	if got := mustCredential(t, "ghcr.io"); got != (justpull.Credential{}) {
+		t.Fatalf("empty file: got %+v", got)
+	}
+}
+
+func TestMalformedConfigIsAnError(t *testing.T) {
+	writeConfig(t, `{"auths":`)
+	if _, err := Load(); err == nil {
+		t.Fatal("no error")
+	}
+}
+
+func TestPlatformStoreWhenTheConfigNamesNoLogin(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the fake helper stands in for Linux's secretservice")
+	}
+	dir := helperDir(t, true)
+	writeHelper(t, dir, "secretservice", echoHelper("secretservice"))
+	t.Setenv("DOCKER_CONFIG", t.TempDir())
+	if got := mustCredential(t, "ghcr.io"); got.Username != "secretservice@ghcr.io" {
+		t.Fatalf("missing file: got %+v, want the platform store's login", got)
+	}
+	writeConfig(t, `{"auths":{"quay.io":{}}}`)
+	if got := mustCredential(t, "ghcr.io"); got != (justpull.Credential{}) {
+		t.Fatalf("a config with auths: got %+v, want no login", got)
+	}
+}
+
+func TestDockerConfigDefaultsToHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("DOCKER_CONFIG", "")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	if err := os.Mkdir(filepath.Join(home, ".docker"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := `{"auths":{"ghcr.io":{"auth":"` + basic("home", "pw") + `"}}}`
+	if err := os.WriteFile(filepath.Join(home, ".docker", "config.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	want := justpull.Credential{Username: "home", Password: "pw"}
+	if got := mustCredential(t, "ghcr.io"); got != want {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+}
