@@ -553,7 +553,9 @@ func screen(s string) []string {
 	for i := 0; i < len(s); i++ {
 		switch c := s[i]; {
 		case c == '\n':
-			row++
+			// A terminal's output processing (onlcr) turns a newline into
+			// a carriage return too, and docker's output relies on it.
+			row, col = row+1, 0
 			if row == len(lines) {
 				lines = append(lines, "")
 			}
