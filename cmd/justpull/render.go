@@ -20,10 +20,15 @@ type renderer struct {
 	width  int
 	rename func(string) string
 	now    func() time.Time
+	// upToDate, if set, reports whether the user's name ref (as the status
+	// line names it, renamed) already pointed to the image with digest
+	// before the pull. Set it before render.
+	upToDate func(ref, digest string) bool
 
-	mu    sync.Mutex
-	lines map[string]int // a layer's line, counted from the first since the last line without progress
-	ended bool
+	mu     sync.Mutex
+	lines  map[string]int // a layer's line, counted from the first since the last line without progress
+	ended  bool
+	digest string // the stream's last "Digest: " line
 }
 
 // message is one message of Docker's JSON stream, as the docker CLI reads
@@ -87,6 +92,7 @@ func (r *renderer) render(stream io.Reader) error {
 		}
 		m.Status, m.Stream = r.rename(m.Status), r.rename(m.Stream)
 		r.mu.Lock()
+		r.status(&m)
 		err := r.show(m)
 		r.mu.Unlock()
 		if err != nil {
@@ -107,6 +113,30 @@ func (r *renderer) resumed(id string, offset int64) {
 		return
 	}
 	_ = r.show(message{ID: id, Status: "Resuming at " + humanSize(float64(offset)), Progress: &progress{}})
+}
+
+const (
+	digestStatus   = "Digest: "
+	newerStatus    = "Status: Downloaded newer image for "
+	upToDateStatus = "Status: Image is up to date for "
+)
+
+// status turns dockerd's "Downloaded newer image" into "Image is up to date"
+// when upToDate says the user's name already pointed to the image of the
+// stream's last Digest line. dockerd compares the pulled name's image before
+// and after, but it pulled the local name, which is always new to it. The
+// caller holds mu.
+func (r *renderer) status(m *message) {
+	if r.upToDate == nil || m.ID != "" {
+		return
+	}
+	if d, ok := strings.CutPrefix(m.Status, digestStatus); ok {
+		r.digest = d
+		return
+	}
+	if ref, ok := strings.CutPrefix(m.Status, newerStatus); ok && r.digest != "" && r.upToDate(ref, r.digest) {
+		m.Status = upToDateStatus + ref
+	}
 }
 
 // show prints m as one write. The caller holds mu.

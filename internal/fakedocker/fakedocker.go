@@ -226,6 +226,8 @@ func (f *Docker) pullImage(ctx context.Context, ref, base, name, mref string, en
 		_ = enc.Encode(streamMsg{ID: id, Status: "Download complete"})
 		_ = enc.Encode(streamMsg{ID: id, Status: "Pull complete"})
 	}
+	sum := sha256.Sum256(raw)
+	_ = enc.Encode(streamMsg{Status: "Digest: sha256:" + hex.EncodeToString(sum[:])})
 	_ = enc.Encode(streamMsg{Status: "Status: Downloaded newer image for " + ref})
 	return nil
 }

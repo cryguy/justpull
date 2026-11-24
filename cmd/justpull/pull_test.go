@@ -26,6 +26,8 @@ type fakeDocker struct {
 	d   *fakedocker.Docker
 	// tags is ListTags' answer, as tags of the repository asked for.
 	tags []string
+	// images is ImageInfo's answer, by the reference asked for.
+	images map[string]engine.Image
 	// pullErr, if set, may fail a pull as the daemon's API does.
 	pullErr func(image string) error
 	// failStart makes the container end at once with this on stderr.
@@ -139,6 +141,11 @@ func (f *fakeDocker) ListTags(_ context.Context, repo string) ([]string, error) 
 	return refs, nil
 }
 
+func (f *fakeDocker) ImageInfo(_ context.Context, ref string) (engine.Image, bool, error) {
+	img, ok := f.images[ref]
+	return img, ok, nil
+}
+
 // proxyRepo is the local repository of the first pull: the proxy's.
 func (f *fakeDocker) proxyRepo(t *testing.T) string {
 	t.Helper()
@@ -218,6 +225,7 @@ func TestPullTagsTheImageAndPrintsAsDocker(t *testing.T) {
 		l1 + ": Pulling fs layer\n" + l2 + ": Pulling fs layer\n" +
 		l1 + ": Download complete\n" + l1 + ": Pull complete\n" +
 		l2 + ": Download complete\n" + l2 + ": Pull complete\n" +
+		"Digest: " + img.Digest + "\n" +
 		"Status: Downloaded newer image for " + reg.Host + "/team/app:latest\n" +
 		reg.Host + "/team/app:latest\n"
 	if res.stdout != want {
@@ -288,13 +296,17 @@ func TestRegistryAuthNamesDockerHubAsDockerDoes(t *testing.T) {
 
 func TestPullAllTagsRetagsEveryTag(t *testing.T) {
 	reg := fakereg.New(t)
-	reg.AddImage("team/app", "v1", 100_000)
-	reg.AddImage("team/app", "v2", 120_000)
+	v1 := reg.AddImage("team/app", "v1", 100_000)
+	v2 := reg.AddImage("team/app", "v2", 120_000)
 	f := newFake(t)
 	f.tags = []string{"v1", "v2"}
+	name := reg.Host + "/team/app"
+	f.images = map[string]engine.Image{name + ":v1": {RepoDigests: []string{name + "@" + v1.Digest}}}
 
-	res := runPull(t, context.Background(), f, nil, nil, "-a", reg.Host+"/team/app")
-	if res.code != 0 || strings.Contains(res.stdout, "Using default tag") || !strings.HasSuffix(res.stdout, "Status: Downloaded newer image for "+reg.Host+"/team/app:v2\n"+reg.Host+"/team/app\n") {
+	res := runPull(t, context.Background(), f, nil, nil, "-a", name)
+	if res.code != 0 || strings.Contains(res.stdout, "Using default tag") ||
+		!strings.Contains(res.stdout, "\nDigest: "+v1.Digest+"\nStatus: Image is up to date for "+name+":v1\n") ||
+		!strings.HasSuffix(res.stdout, "\nDigest: "+v2.Digest+"\nStatus: Downloaded newer image for "+name+":v2\n"+name+"\n") {
 		t.Fatalf("exit code %d, stdout %q, stderr %q", res.code, res.stdout, res.stderr)
 	}
 	proxy := f.proxyRepo(t)
@@ -306,6 +318,52 @@ func TestPullAllTagsRetagsEveryTag(t *testing.T) {
 		t.Fatalf("tagged %q, untagged %q", f.tagged, f.untagged)
 	}
 	f.finishSent(t, true)
+}
+
+func TestPullSaysUpToDateAsDocker(t *testing.T) {
+	reg := fakereg.New(t)
+	img := reg.AddImage("team/app", "v1", 100_000)
+	name := reg.Host + "/team/app"
+	other := "sha256:" + strings.Repeat("0", 64)
+	tests := []struct {
+		name   string
+		ref    string
+		images map[string]engine.Image
+		want   string
+	}{
+		{"present at the same digest", name + ":v1", map[string]engine.Image{name + ":v1": {ID: "sha256:abc", RepoDigests: []string{name + "@" + other, name + "@" + img.Digest}}}, "Status: Image is up to date for " + name + ":v1"},
+		{"present at another digest", name + ":v1", map[string]engine.Image{name + ":v1": {ID: "sha256:abc", RepoDigests: []string{name + "@" + other}}}, "Status: Downloaded newer image for " + name + ":v1"},
+		{"the digest only under another repository", name + ":v1", map[string]engine.Image{name + ":v1": {ID: "sha256:abc", RepoDigests: []string{"team/app@" + img.Digest}}}, "Status: Downloaded newer image for " + name + ":v1"},
+		{"absent", name + ":v1", nil, "Status: Downloaded newer image for " + name + ":v1"},
+		{"a digest reference present", name + "@" + img.Digest, map[string]engine.Image{name + "@" + img.Digest: {ID: "sha256:abc", RepoDigests: []string{name + "@" + img.Digest}}}, "Status: Image is up to date for " + name + "@" + img.Digest},
+		{"a digest reference absent", name + "@" + img.Digest, nil, "Status: Downloaded newer image for " + name + "@" + img.Digest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFake(t)
+			f.images = tt.images
+			res := runPull(t, context.Background(), f, nil, nil, tt.ref)
+			if want := "\nDigest: " + img.Digest + "\n" + tt.want + "\n" + tt.ref + "\n"; res.code != 0 || !strings.HasSuffix(res.stdout, want) {
+				t.Fatalf("exit code %d, stdout %q, stderr %q; want the end %q", res.code, res.stdout, res.stderr, want)
+			}
+		})
+	}
+}
+
+func TestUpToDateReadsDockersNames(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	for _, tt := range []struct{ user, inspected, status string }{
+		{"alpine:3.20", "docker.io/library/alpine:3.20", "alpine:3.20"},
+		{"alpine:3.20@" + digest, "docker.io/library/alpine@" + digest, "alpine@" + digest},
+	} {
+		named, _ := reference.ParseNormalizedNamed(tt.user)
+		f := newFake(t)
+		f.images = map[string]engine.Image{tt.inspected: {ID: "sha256:abc", RepoDigests: []string{"alpine@" + digest}}}
+		held, err := (&puller{named: named}).held(context.Background(), f)
+		if err != nil || !upToDate(held)(tt.status, digest) {
+			t.Errorf("%s: held %v, %v; want %s up to date", tt.user, held, err, tt.status)
+		}
+	}
 }
 
 func TestPullPrintsTheProxysCauseAndFinishesAsFailed(t *testing.T) {

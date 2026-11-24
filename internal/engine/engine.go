@@ -54,10 +54,36 @@ func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if re, ok := errors.AsType[*runError](err); ok && strings.Contains(re.stderr, "No such image") {
+	if noSuchImage(err) {
 		return false, nil
 	}
 	return false, err
+}
+
+// Image is what docker image inspect reports of an image.
+type Image struct {
+	ID string
+	// RepoDigests are its names by digest, such as alpine@sha256:...
+	RepoDigests []string
+}
+
+// ImageInfo returns the image Docker has under ref; ok is false when it has
+// none.
+func (c *Client) ImageInfo(ctx context.Context, ref string) (img Image, ok bool, err error) {
+	out, err := c.run(ctx, nil, "image", "inspect", "--format", "{{.Id}}{{range .RepoDigests}}\t{{.}}{{end}}", ref)
+	if err != nil {
+		if noSuchImage(err) {
+			return Image{}, false, nil
+		}
+		return Image{}, false, err
+	}
+	fields := strings.Split(strings.TrimSpace(out), "\t")
+	return Image{ID: fields[0], RepoDigests: fields[1:]}, true, nil
+}
+
+func noSuchImage(err error) bool {
+	re, ok := errors.AsType[*runError](err)
+	return ok && strings.Contains(re.stderr, "No such image")
 }
 
 // ListTags returns the names docker images lists for repo, as repo:tag.

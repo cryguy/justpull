@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -102,6 +103,12 @@ func (p *puller) run(ctx context.Context) int {
 	if err != nil {
 		return p.failed(ctx, err)
 	}
+	var held map[string][]string
+	if !p.opts.quiet {
+		if held, err = p.held(ctx, d); err != nil {
+			return p.failed(ctx, err)
+		}
+	}
 	progress := p.e.stderr
 	if p.opts.quiet {
 		progress = io.Discard
@@ -115,7 +122,61 @@ func (p *puller) run(ctx context.Context) int {
 		return p.failed(ctx, err)
 	}
 	s := newSession(proc)
-	return p.session(ctx, d, s, cred)
+	return p.session(ctx, d, s, cred, held)
+}
+
+// held records what the user's names point to before the pull: for each name,
+// by heldKey, the digests of the user's repository its image holds. A name
+// Docker does not have is left out. With all tags the names are the
+// repository's tags Docker has.
+func (p *puller) held(ctx context.Context, d dockerAPI) (map[string][]string, error) {
+	refs := []string{heldKey(p.named)}
+	if p.opts.all {
+		var err error
+		if refs, err = d.ListTags(ctx, reference.FamiliarName(p.named)); err != nil {
+			return nil, err
+		}
+	}
+	held := map[string][]string{}
+	for _, ref := range refs {
+		img, ok, err := d.ImageInfo(ctx, ref)
+		if err != nil {
+			return nil, err
+		}
+		named, perr := reference.ParseNormalizedNamed(ref)
+		if !ok || perr != nil {
+			continue
+		}
+		key := heldKey(named)
+		for _, rd := range img.RepoDigests {
+			c, err := reference.ParseNormalizedNamed(rd)
+			if err != nil || c.Name() != p.named.Name() {
+				continue
+			}
+			if dg, ok := c.(reference.Digested); ok {
+				held[key] = append(held[key], dg.Digest().String())
+			}
+		}
+	}
+	return held, nil
+}
+
+// heldKey is how a status line names ref: by its digest alone when it has
+// one, as the proxy's local name drops the tag of a tag and digest.
+func heldKey(ref reference.Named) string {
+	if d, ok := ref.(reference.Digested); ok {
+		return reference.TrimNamed(ref).String() + "@" + d.Digest().String()
+	}
+	return ref.String()
+}
+
+// upToDate is the renderer's upToDate for the names held: dockerd reports a
+// pull up to date when the name's image is the one it pulled.
+func upToDate(held map[string][]string) func(ref, digest string) bool {
+	return func(ref, digest string) bool {
+		named, err := reference.ParseNormalizedNamed(ref)
+		return err == nil && slices.Contains(held[heldKey(named)], digest)
+	}
 }
 
 // login finds the login docker would use. A config docker cannot read is a
@@ -150,7 +211,7 @@ func (p *puller) failed(ctx context.Context, err error) int {
 	return 1
 }
 
-func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred justpull.Credential) int {
+func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred justpull.Credential, held map[string][]string) int {
 	req := request{Ref: p.named.String(), AllTags: p.opts.all}
 	req.Credential.Username = cred.Username
 	req.Credential.Password = cred.Password
@@ -198,6 +259,7 @@ func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred just
 	}
 	rename := renamer(local, p.named)
 	r := newRenderer(p.e.stdout, p.e.tty, p.e.width, p.opts.quiet, rename)
+	r.upToDate = upToDate(held)
 	pullCtx, cancelPull := context.WithCancel(ctx)
 	defer cancelPull()
 	s.dispatch(r, cancelPull)
