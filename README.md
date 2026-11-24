@@ -110,3 +110,7 @@ links, and scripted faults per blob request (cut, reset, stall, corruption,
 ignored `Range`, wrong start offset, `401` without a challenge). A fake Docker
 pulls through the proxy the way dockerd does, including skipping manifests and
 layers it already holds.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
