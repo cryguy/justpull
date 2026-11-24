@@ -1,10 +1,13 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +23,9 @@ type renderer struct {
 	width  int
 	rename func(string) string
 	now    func() time.Time
+	// after runs f after d, as time.AfterFunc does, and returns the timer's
+	// Stop.
+	after func(d time.Duration, f func()) (stop func() bool)
 	// renameID, if set, maps a message's id to what the user pulled. A
 	// digest pull's first message has the local reference as its id. Set it
 	// before render.
@@ -30,8 +36,21 @@ type renderer struct {
 	upToDate func(ref string) bool
 
 	mu    sync.Mutex
-	lines map[string]int // a layer's line, counted from the first since the last line without progress
+	lines map[string]int   // a layer's line, counted from the first since the last line without progress
+	holds map[string]*hold // the layers whose "Resuming at" line is held on screen
 	ended bool
+}
+
+// resumeHold is how long a layer's "Resuming at" line stays in a terminal.
+// Docker's next message for the layer comes within milliseconds and would
+// replace it before anyone could read it.
+const resumeHold = 2 * time.Second
+
+// hold keeps a layer's "Resuming at" line on screen. Docker's messages for
+// the layer wait; when the hold ends, the newest one is drawn.
+type hold struct {
+	stop func() bool
+	next *message // Docker's newest message for the layer, not drawn yet
 }
 
 // message is one message of Docker's JSON stream, as the docker CLI reads
@@ -72,16 +91,25 @@ func newRenderer(out io.Writer, tty bool, width int, quiet bool, rename func(str
 	if quiet {
 		out, tty = io.Discard, false
 	}
-	return &renderer{out: out, tty: tty, width: width, rename: rename, now: time.Now, lines: map[string]int{}}
+	return &renderer{
+		out: out, tty: tty, width: width, rename: rename, now: time.Now, after: afterFunc,
+		lines: map[string]int{}, holds: map[string]*hold{},
+	}
+}
+
+func afterFunc(d time.Duration, f func()) func() bool {
+	return time.AfterFunc(d, f).Stop
 }
 
 // render reads Docker's JSON message stream to its end and prints it. It
 // returns the stream's error message (renamed) when the pull failed inside
-// the stream, like readStream does, or a read error.
+// the stream, like readStream does, or a read error. It draws every held
+// line before it returns.
 func (r *renderer) render(stream io.Reader) error {
 	defer func() {
 		r.mu.Lock()
 		r.ended = true
+		r.release()
 		r.mu.Unlock()
 	}()
 	dec := json.NewDecoder(stream)
@@ -108,17 +136,62 @@ func (r *renderer) render(stream io.Reader) error {
 }
 
 // resumed shows that the proxy resumed a layer's download: in a terminal the
-// layer's line reads "<id>: Resuming at <size>" until Docker's next message
-// for that layer replaces it; otherwise one such line is printed. id is the
-// 12-hex layer ID docker uses. size uses the same units docker prints. Safe to
-// call from another goroutine while render runs.
+// layer's line reads "<id>: Resuming at <size>" for resumeHold, or until a
+// line without progress or the stream's end, and then shows Docker's newest
+// message for the layer; otherwise one such line is printed. A second resume
+// during the hold restarts it. id is the 12-hex layer ID docker uses. size
+// uses the same units docker prints. Safe to call from another goroutine
+// while render runs.
 func (r *renderer) resumed(id string, offset int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.ended {
 		return
 	}
+	var next *message
+	if h, ok := r.holds[id]; ok {
+		h.stop()
+		next = h.next
+		delete(r.holds, id)
+	}
 	_ = r.show(message{ID: id, Status: "Resuming at " + humanSize(float64(offset)), Progress: &progress{}})
+	if !r.tty {
+		return
+	}
+	h := &hold{next: next}
+	h.stop = r.after(resumeHold, func() { r.unhold(id, h) })
+	r.holds[id] = h
+}
+
+// unhold ends id's hold h, unless it already ended, and draws the message it
+// kept.
+func (r *renderer) unhold(id string, h *hold) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.holds[id] != h {
+		return
+	}
+	delete(r.holds, id)
+	if h.next != nil {
+		_ = r.show(*h.next)
+	}
+}
+
+// release ends every hold and draws the messages they kept, top line first.
+// The caller holds mu.
+func (r *renderer) release() {
+	if len(r.holds) == 0 {
+		return
+	}
+	ids := slices.SortedFunc(maps.Keys(r.holds), func(a, b string) int { return cmp.Compare(r.lines[a], r.lines[b]) })
+	for _, id := range ids {
+		h := r.holds[id]
+		delete(r.holds, id)
+		h.stop()
+		if h.next != nil {
+			_ = r.show(*h.next)
+		}
+	}
 }
 
 const (
@@ -142,6 +215,15 @@ func (r *renderer) status(m *message) {
 func (r *renderer) show(m message) error {
 	if m.Aux != nil {
 		return nil
+	}
+	if m.ID != "" && m.Progress != nil {
+		if h, ok := r.holds[m.ID]; ok {
+			h.next = &m
+			return nil
+		}
+	} else {
+		// The held lines are drawn while they can still be rewritten.
+		r.release()
 	}
 	var b strings.Builder
 	var diff int
