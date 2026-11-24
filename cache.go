@@ -59,7 +59,6 @@ type Cache struct {
 	idleTimeout time.Duration
 	retryBase   time.Duration
 	retryMax    time.Duration
-	scheme      string
 
 	up *upstream
 
@@ -88,7 +87,6 @@ func New(dir string, opts Options) (*Cache, error) {
 		idleTimeout: defaultIdleTimeout,
 		retryBase:   defaultRetryBase,
 		retryMax:    defaultRetryMax,
-		scheme:      "https",
 		up:          newUpstream(),
 		blobs:       map[string]*blob{},
 	}, nil
