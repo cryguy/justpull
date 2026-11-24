@@ -66,6 +66,13 @@ justpull.Options{Credentials: func(ctx context.Context, registry string) (justpu
 }}
 ```
 
+To make the Docker calls yourself, `cache.Serve(ctx, ref, justpull.SessionOptions{})`
+starts the proxy of one pull and returns a `Session`; `Pull` is built on it.
+Docker pulls `s.LocalRef()`. `s.Context()` ends, with the failure as its cause,
+when a layer fails for good; cancel Docker's pull then. Tag the image and end
+with `s.Finish(success)`, which deletes the image's cached files only on
+success.
+
 ## Behaviour
 
 - **Resume.** Each layer is written to `<dir>/blobs/sha256/<hex>.partial` as it

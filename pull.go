@@ -19,10 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/distribution/reference"
 )
@@ -114,46 +111,15 @@ func (t target) localRef(addr string) string {
 // sharing those layers continues where this one stopped. progress may be
 // nil; it is called from Pull's goroutine.
 func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Progress)) error {
-	t, err := parseRef(ref)
+	s, err := c.Serve(ctx, ref, SessionOptions{})
 	if err != nil {
-		return fmt.Errorf("justpull: %w", err)
+		return err
 	}
-	if err := c.Sweep(); err != nil {
-		c.opts.Logger.Warn("cache sweep failed", "err", err)
-	}
+	defer s.Stop()
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return fmt.Errorf("justpull: listen: %w", err)
-	}
-	pctx, cancel := context.WithCancelCause(ctx)
-	p := newProxy(pctx, c, t, cancel)
-	srv := &http.Server{
-		Handler:           p,
-		ReadHeaderTimeout: 30 * time.Second,
-		BaseContext:       func(net.Listener) context.Context { return pctx },
-	}
-	go func() { _ = srv.Serve(ln) }()
-	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			cancel(nil)
-			// Handlers return quickly once pctx ends; waiting for them means
-			// no request still holds a blob when the files are removed.
-			sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer scancel()
-			if err := srv.Shutdown(sctx); err != nil {
-				_ = srv.Close()
-			}
-			p.wg.Wait()
-			p.unpin()
-		})
-	}
-	defer stop()
-
-	local := t.localRef(ln.Addr().String())
-	if err := dockerPull(pctx, d, local, p.layerSize, progress); err != nil {
-		switch cause := context.Cause(pctx); {
+	t, local := s.t, s.LocalRef()
+	if err := dockerPull(s.Context(), d, local, s.LayerSize, progress); err != nil {
+		switch cause := context.Cause(s.Context()); {
 		case ctx.Err() != nil:
 			err = ctx.Err()
 		case cause != nil && !errors.Is(cause, context.Canceled):
@@ -162,7 +128,7 @@ func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Pr
 		}
 		return fmt.Errorf("justpull: pull %s: %w", ref, err)
 	}
-	stop()
+	s.Stop()
 
 	if t.digest == "" {
 		if err := d.Tag(ctx, local, t.original); err != nil {
@@ -176,12 +142,8 @@ func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Pr
 	if err := d.Untag(ctx, local); err != nil {
 		c.opts.Logger.Warn("could not remove the localhost image name", "ref", local, "err", err)
 	}
-	blobs, manifests := p.imageFiles()
-	if err := c.removeBlobs(blobs); err != nil {
-		c.opts.Logger.Warn("could not delete cached layers", "err", err)
-	}
-	if err := c.removeManifests(manifests); err != nil {
-		c.opts.Logger.Warn("could not delete cached manifests", "err", err)
+	if err := s.Finish(true); err != nil {
+		c.opts.Logger.Warn("could not delete cached files", "err", err)
 	}
 	return nil
 }
