@@ -1,4 +1,4 @@
-package dockercachepull
+package justpull
 
 import (
 	"bytes"

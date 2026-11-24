@@ -1,4 +1,4 @@
-// Package dockercachepull pulls container images through a local
+// Package justpull pulls container images through a local
 // pull-through proxy that keeps every downloaded byte on disk, so a pull
 // broken by the network, a failed attempt or a restart continues where it
 // stopped instead of starting over.
@@ -10,7 +10,7 @@
 // download, so Docker's own connection never breaks. After a successful
 // pull the image gets its real name, the localhost name is removed and the
 // cached files are deleted.
-package dockercachepull
+package justpull
 
 import (
 	"context"
@@ -109,7 +109,7 @@ func (t target) localRef(addr string) string {
 func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Progress)) error {
 	t, err := parseRef(ref)
 	if err != nil {
-		return fmt.Errorf("dockercachepull: %w", err)
+		return fmt.Errorf("justpull: %w", err)
 	}
 	if err := c.Sweep(); err != nil {
 		c.opts.Logger.Warn("cache sweep failed", "err", err)
@@ -117,7 +117,7 @@ func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Pr
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		return fmt.Errorf("dockercachepull: listen: %w", err)
+		return fmt.Errorf("justpull: listen: %w", err)
 	}
 	pctx, cancel := context.WithCancelCause(ctx)
 	p := newProxy(pctx, c, t, cancel)
@@ -152,18 +152,18 @@ func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Pr
 			// A layer failure cancelled Docker's pull; it says why.
 			err = cause
 		}
-		return fmt.Errorf("dockercachepull: pull %s: %w", ref, err)
+		return fmt.Errorf("justpull: pull %s: %w", ref, err)
 	}
 	stop()
 
 	if t.digest == "" {
 		if err := d.Tag(ctx, local, t.original); err != nil {
-			return fmt.Errorf("dockercachepull: tag %s: %w", t.original, err)
+			return fmt.Errorf("justpull: tag %s: %w", t.original, err)
 		}
 	} else if err := dockerPull(ctx, d, t.original, nil, nil); err != nil {
 		// A digest reference cannot be created with a tag. Pulling it costs
 		// one manifest request: every layer is already in Docker.
-		return fmt.Errorf("dockercachepull: pull %s: %w", t.original, err)
+		return fmt.Errorf("justpull: pull %s: %w", t.original, err)
 	}
 	if err := d.Untag(ctx, local); err != nil {
 		c.opts.Logger.Warn("could not remove the localhost image name", "ref", local, "err", err)

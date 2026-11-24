@@ -1,4 +1,4 @@
-package dockercachepull
+package justpull
 
 import (
 	"context"
@@ -83,7 +83,7 @@ func New(dir string, opts Options) (*Cache, error) {
 	mdir := filepath.Join(dir, "manifests", "sha256")
 	for _, d := range []string{bdir, mdir} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
-			return nil, fmt.Errorf("dockercachepull: create cache dir: %w", err)
+			return nil, fmt.Errorf("justpull: create cache dir: %w", err)
 		}
 	}
 	return &Cache{
@@ -490,7 +490,7 @@ func (c *Cache) Sweep() error {
 func sweepDir(dir string, cutoff time.Time, ours func(name string) bool) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return fmt.Errorf("dockercachepull: sweep: %w", err)
+		return fmt.Errorf("justpull: sweep: %w", err)
 	}
 	var errs []error
 	for _, e := range entries {

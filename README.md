@@ -1,4 +1,4 @@
-# docker-cache-pull
+# justpull
 
 A Go library that pulls container images so that a broken download picks up
 where it stopped instead of starting over: inside one pull, across failed
@@ -20,11 +20,11 @@ Linux only. Pure Go; one dependency, `github.com/distribution/reference`.
 ## Use
 
 ```go
-cache, err := dockercachepull.New("/var/lib/example/pullcache", dockercachepull.Options{})
+cache, err := justpull.New("/var/lib/example/pullcache", justpull.Options{})
 if err != nil {
 	return err
 }
-err = cache.Pull(ctx, dockerAdapter{cli}, "alpine:3.20", func(p dockercachepull.Progress) {
+err = cache.Pull(ctx, dockerAdapter{cli}, "alpine:3.20", func(p justpull.Progress) {
 	// p.Done and p.Total are compressed bytes of the layers Docker is downloading.
 })
 ```
