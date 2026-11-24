@@ -25,17 +25,55 @@ import (
 // dockerd's progress stream.
 type fakeDocker struct {
 	client *http.Client
+	// reuseManifests makes it skip the GET for a manifest it already holds
+	// (a HEAD resolves the tag), as the containerd store does.
+	reuseManifests bool
 
-	mu       sync.Mutex
-	have     map[string]bool
-	blobGets map[string]int
-	pulls    []string
-	tags     [][2]string
-	untags   []string
+	mu        sync.Mutex
+	have      map[string]bool
+	manifests map[string][]byte
+	blobGets  map[string]int
+	pulls     []string
+	tags      [][2]string
+	untags    []string
 }
 
 func newFakeDocker() *fakeDocker {
-	return &fakeDocker{client: &http.Client{}, have: map[string]bool{}, blobGets: map[string]int{}}
+	return &fakeDocker{client: &http.Client{}, have: map[string]bool{}, manifests: map[string][]byte{}, blobGets: map[string]int{}}
+}
+
+func (f *fakeDocker) manifest(ctx context.Context, url string) ([]byte, error) {
+	if f.reuseManifests {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodHead, url, nil)
+		req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
+		resp, err := f.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		_ = resp.Body.Close()
+		f.mu.Lock()
+		raw, ok := f.manifests[resp.Header.Get("Docker-Content-Digest")]
+		f.mu.Unlock()
+		if ok {
+			return raw, nil
+		}
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("manifest: %s: %s", resp.Status, raw)
+	}
+	sum := sha256.Sum256(raw)
+	f.mu.Lock()
+	f.manifests["sha256:"+hex.EncodeToString(sum[:])] = raw
+	f.mu.Unlock()
+	return raw, nil
 }
 
 func (f *fakeDocker) Pull(ctx context.Context, ref string) (io.ReadCloser, error) {
@@ -83,16 +121,9 @@ func (f *fakeDocker) pull(ctx context.Context, ref string, enc *json.Encoder) er
 	}
 	base := "http://" + host + "/v2/" + name
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/manifests/"+mref, nil)
-	req.Header.Add("Accept", "application/vnd.oci.image.manifest.v1+json")
-	resp, err := f.client.Do(req)
+	raw, err := f.manifest(ctx, base+"/manifests/"+mref)
 	if err != nil {
 		return err
-	}
-	raw, _ := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("manifest: %s: %s", resp.Status, raw)
 	}
 	var m struct {
 		Config struct{ Digest string } `json:"config"`
@@ -205,16 +236,20 @@ func newPullCache(t *testing.T, stall time.Duration) *Cache {
 	return c
 }
 
+// cacheFiles lists the blob files by name and the saved manifests as
+// "m/<name>".
 func cacheFiles(t *testing.T, c *Cache) map[string]int64 {
 	t.Helper()
-	entries, err := os.ReadDir(c.dir)
-	if err != nil {
-		t.Fatal(err)
-	}
 	out := map[string]int64{}
-	for _, e := range entries {
-		info, _ := e.Info()
-		out[e.Name()] = info.Size()
+	for prefix, dir := range map[string]string{"": c.dir, "m/": c.mdir} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			info, _ := e.Info()
+			out[prefix+e.Name()] = info.Size()
+		}
 	}
 	return out
 }
@@ -406,6 +441,35 @@ func TestFailedPullIsResumedByTheNextPull(t *testing.T) {
 	}
 	if !resumed || refetchedSmall {
 		t.Fatalf("resumed at %d: %v; refetched the finished layer: %v", kept, resumed, refetchedSmall)
+	}
+	if files := cacheFiles(t, c); len(files) != 0 {
+		t.Fatalf("cache not emptied after success: %v", files)
+	}
+}
+
+// The containerd store can still hold a failed attempt's finished layers
+// when the next attempt starts, and then never asks for them.
+func TestSuccessRemovesCachedLayersDockerSkipped(t *testing.T) {
+	reg := fakereg.New(t)
+	img := reg.AddImage("team/app", "v1", 100_000, 400_000)
+	small, big := img.Layers[0], img.Layers[1]
+	big.Faults(fakereg.Cut)
+	big.SetBroken(true)
+	c := newPullCache(t, 400*time.Millisecond)
+	d := newFakeDocker()
+	d.reuseManifests = true
+	if err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", nil); err == nil {
+		t.Fatal("first pull should fail")
+	}
+
+	big.SetBroken(false)
+	d.have[small.Digest] = true
+	before := d.gets(small.Digest)
+	if err := c.Pull(context.Background(), d, reg.Host+"/team/app:v1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if d.gets(small.Digest) != before {
+		t.Fatal("docker asked for a layer it has")
 	}
 	if files := cacheFiles(t, c); len(files) != 0 {
 		t.Fatalf("cache not emptied after success: %v", files)

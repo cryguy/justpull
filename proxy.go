@@ -26,9 +26,10 @@ type proxy struct {
 	fail func(error)
 	wg   sync.WaitGroup // running downloads
 
-	mu      sync.Mutex
-	sizes   map[string]int64 // hex digest -> size, from relayed manifests
-	touched map[string]bool
+	mu        sync.Mutex
+	sizes     map[string]int64 // hex digest -> size, from this image's manifests
+	touched   map[string]bool  // blobs Docker asked for
+	manifests map[string]bool  // this image's manifests
 }
 
 func newProxy(ctx context.Context, c *Cache, t target, cancel context.CancelCauseFunc) *proxy {
@@ -36,9 +37,10 @@ func newProxy(ctx context.Context, c *Cache, t target, cancel context.CancelCaus
 		ctx:     ctx,
 		c:       c,
 		t:       t,
-		fail:    func(err error) { cancel(err) },
-		sizes:   map[string]int64{},
-		touched: map[string]bool{},
+		fail:      func(err error) { cancel(err) },
+		sizes:     map[string]int64{},
+		touched:   map[string]bool{},
+		manifests: map[string]bool{},
 	}
 }
 
@@ -96,6 +98,13 @@ func (p *proxy) manifest(w http.ResponseWriter, r *http.Request, ref string) {
 		if v := resp.Header.Get("Content-Length"); v != "" {
 			w.Header().Set("Content-Length", v)
 		}
+		// The containerd store skips the GET for a manifest it still holds
+		// from an earlier attempt; a copy saved then still names the blobs.
+		if h, ok := strings.CutPrefix(resp.Header.Get("Docker-Content-Digest"), "sha256:"); ok && resp.StatusCode == http.StatusOK {
+			if body, found := p.c.loadManifest(h); found {
+				p.recordManifest(h, body, 0)
+			}
+		}
 		w.WriteHeader(resp.StatusCode)
 		return
 	}
@@ -109,23 +118,26 @@ func (p *proxy) manifest(w http.ResponseWriter, r *http.Request, ref string) {
 		return
 	}
 	if resp.StatusCode == http.StatusOK {
-		p.recordSizes(body)
+		p.recordManifest(p.c.saveManifest(body), body, 0)
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
 }
 
-// recordSizes notes the blob sizes an image manifest lists, so a download
-// can be checked against them and resumed past its end correctly.
-func (p *proxy) recordSizes(manifest []byte) {
+// recordManifest notes a manifest as part of this pull's image along with
+// the blob sizes it lists, so downloads can be checked against them and the
+// image's files found for cleanup. An index's children are followed if a
+// copy of them was saved.
+func (p *proxy) recordManifest(hexDigest string, manifest []byte, depth int) {
 	type descriptor struct {
 		Digest string `json:"digest"`
 		Size   int64  `json:"size"`
 	}
 	var m struct {
-		Config *descriptor  `json:"config"`
-		Layers []descriptor `json:"layers"`
+		Config    *descriptor  `json:"config"`
+		Layers    []descriptor `json:"layers"`
+		Manifests []descriptor `json:"manifests"`
 	}
 	if json.Unmarshal(manifest, &m) != nil {
 		return
@@ -135,10 +147,25 @@ func (p *proxy) recordSizes(manifest []byte) {
 		descs = append(descs, *m.Config)
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	if hexDigest != "" {
+		p.manifests[hexDigest] = true
+	}
 	for _, d := range descs {
 		if h, ok := strings.CutPrefix(d.Digest, "sha256:"); ok && isHexDigest(h) && d.Size > 0 {
 			p.sizes[h] = d.Size
+		}
+	}
+	p.mu.Unlock()
+	if depth > 0 {
+		return
+	}
+	for _, child := range m.Manifests {
+		h, ok := strings.CutPrefix(child.Digest, "sha256:")
+		if !ok {
+			continue
+		}
+		if body, found := p.c.loadManifest(h); found {
+			p.recordManifest(h, body, depth+1)
 		}
 	}
 }
@@ -154,14 +181,25 @@ func (p *proxy) layerSize(shortID string) int64 {
 	return 0
 }
 
-func (p *proxy) touchedBlobs() []string {
+// imageFiles lists the cached files of this pull's image: every blob its
+// manifests name or Docker asked for, and the saved manifests. Docker skips
+// blobs it still has from an earlier attempt; their cached copies belong to
+// the image all the same.
+func (p *proxy) imageFiles() (blobs, manifests []string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make([]string, 0, len(p.touched))
-	for h := range p.touched {
-		out = append(out, h)
+	for h := range p.sizes {
+		blobs = append(blobs, h)
 	}
-	return out
+	for h := range p.touched {
+		if _, ok := p.sizes[h]; !ok {
+			blobs = append(blobs, h)
+		}
+	}
+	for h := range p.manifests {
+		manifests = append(manifests, h)
+	}
+	return blobs, manifests
 }
 
 // blob serves a blob from the cache, starting its download if needed, and

@@ -48,11 +48,13 @@ type Options struct {
 // Cache stores blobs on disk by digest and pulls images through them, so a
 // download broken by the network, a failed pull or a restart continues where
 // it stopped. Layout: <dir>/blobs/sha256/<hex> once verified,
-// <hex>.partial while downloading.
+// <hex>.partial while downloading; <dir>/manifests/sha256/<hex> for the
+// manifests relayed, which name an image's blobs for cleanup.
 //
 // One Cache should own a directory; its methods are safe for concurrent use.
 type Cache struct {
-	dir  string
+	dir  string // blobs
+	mdir string // manifests
 	opts Options
 
 	// Fixed by New; tests shorten them.
@@ -78,11 +80,15 @@ func New(dir string, opts Options) (*Cache, error) {
 		opts.Logger = slog.Default()
 	}
 	bdir := filepath.Join(dir, "blobs", "sha256")
-	if err := os.MkdirAll(bdir, 0o700); err != nil {
-		return nil, fmt.Errorf("dockercachepull: create cache dir: %w", err)
+	mdir := filepath.Join(dir, "manifests", "sha256")
+	for _, d := range []string{bdir, mdir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			return nil, fmt.Errorf("dockercachepull: create cache dir: %w", err)
+		}
 	}
 	return &Cache{
 		dir:         bdir,
+		mdir:        mdir,
 		opts:        opts,
 		idleTimeout: defaultIdleTimeout,
 		retryBase:   defaultRetryBase,
@@ -467,22 +473,89 @@ func openBlobFile(b *blob, verified bool) (*os.File, error) {
 func (c *Cache) Sweep() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entries, err := os.ReadDir(c.dir)
+	cutoff := time.Now().Add(-c.opts.MaxAge)
+	return errors.Join(
+		sweepDir(c.dir, cutoff, func(name string) bool {
+			hexDigest := strings.TrimSuffix(name, ".partial")
+			return isHexDigest(hexDigest) && c.blobs[hexDigest] == nil
+		}),
+		sweepDir(c.mdir, cutoff, func(name string) bool {
+			return isHexDigest(name) || strings.HasPrefix(name, ".tmp-")
+		}),
+	)
+}
+
+// sweepDir deletes the files in dir that ours accepts and that were last
+// written before cutoff.
+func sweepDir(dir string, cutoff time.Time, ours func(name string) bool) error {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("dockercachepull: sweep: %w", err)
 	}
-	cutoff := time.Now().Add(-c.opts.MaxAge)
 	var errs []error
 	for _, e := range entries {
-		hexDigest := strings.TrimSuffix(e.Name(), ".partial")
-		if !isHexDigest(hexDigest) || c.blobs[hexDigest] != nil {
+		if !ours(e.Name()) {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil || !info.ModTime().Before(cutoff) {
 			continue
 		}
-		if err := os.Remove(filepath.Join(c.dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// saveManifest keeps a copy of a relayed manifest under its sha256 and
+// returns that digest. Failing to save only costs cleanup precision, so it
+// is logged, not returned.
+func (c *Cache) saveManifest(body []byte) string {
+	sum := sha256.Sum256(body)
+	hexDigest := hex.EncodeToString(sum[:])
+	path := filepath.Join(c.mdir, hexDigest)
+	if _, err := os.Stat(path); err == nil {
+		now := time.Now()
+		_ = os.Chtimes(path, now, now)
+		return hexDigest
+	}
+	f, err := os.CreateTemp(c.mdir, ".tmp-")
+	if err != nil {
+		c.opts.Logger.Warn("could not save manifest", "err", err)
+		return hexDigest
+	}
+	_, werr := f.Write(body)
+	cerr := f.Close()
+	if err := errors.Join(werr, cerr); err != nil {
+		_ = os.Remove(f.Name())
+		c.opts.Logger.Warn("could not save manifest", "err", err)
+		return hexDigest
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		_ = os.Remove(f.Name())
+		c.opts.Logger.Warn("could not save manifest", "err", err)
+	}
+	return hexDigest
+}
+
+// loadManifest returns a saved manifest if its bytes still match its digest.
+func (c *Cache) loadManifest(hexDigest string) ([]byte, bool) {
+	if !isHexDigest(hexDigest) {
+		return nil, false
+	}
+	body, err := os.ReadFile(filepath.Join(c.mdir, hexDigest))
+	if err != nil {
+		return nil, false
+	}
+	sum := sha256.Sum256(body)
+	return body, hex.EncodeToString(sum[:]) == hexDigest
+}
+
+func (c *Cache) removeManifests(hexDigests []string) error {
+	var errs []error
+	for _, hexDigest := range hexDigests {
+		if err := os.Remove(filepath.Join(c.mdir, hexDigest)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}

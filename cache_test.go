@@ -401,6 +401,41 @@ func TestSweepDeletesOnlyOldUnusedFiles(t *testing.T) {
 	}
 }
 
+func TestSavedManifestsLoadVerifyAndAreSwept(t *testing.T) {
+	c := newTestCache(t, time.Second)
+	body := []byte(`{"schemaVersion":2}`)
+	h := c.saveManifest(body)
+	if got, ok := c.loadManifest(h); !ok || string(got) != string(body) {
+		t.Fatalf("load = %q, %v", got, ok)
+	}
+	if err := os.WriteFile(filepath.Join(c.mdir, h), []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.loadManifest(h); ok {
+		t.Fatal("a manifest that no longer matches its digest loaded")
+	}
+
+	old := time.Now().Add(-2 * time.Hour)
+	stale, fresh := strings.Repeat("1", 64), strings.Repeat("2", 64)
+	for _, f := range []string{stale, fresh, ".tmp-123"} {
+		p := filepath.Join(c.mdir, f)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if f != fresh {
+			if err := os.Chtimes(p, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := c.Sweep(); err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(filepath.Join(c.mdir, stale)) || fileExists(filepath.Join(c.mdir, ".tmp-123")) || !fileExists(filepath.Join(c.mdir, fresh)) {
+		t.Fatal("sweep of saved manifests kept or dropped the wrong files")
+	}
+}
+
 func TestRemoveBlobsSkipsBlobsInUse(t *testing.T) {
 	c := newTestCache(t, time.Second)
 	free, busy := strings.Repeat("e", 64), strings.Repeat("f", 64)

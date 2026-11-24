@@ -168,8 +168,12 @@ func (c *Cache) Pull(ctx context.Context, d Docker, ref string, progress func(Pr
 	if err := d.Untag(ctx, local); err != nil {
 		c.opts.Logger.Warn("could not remove the localhost image name", "ref", local, "err", err)
 	}
-	if err := c.removeBlobs(p.touchedBlobs()); err != nil {
+	blobs, manifests := p.imageFiles()
+	if err := c.removeBlobs(blobs); err != nil {
 		c.opts.Logger.Warn("could not delete cached layers", "err", err)
+	}
+	if err := c.removeManifests(manifests); err != nil {
+		c.opts.Logger.Warn("could not delete cached manifests", "err", err)
 	}
 	return nil
 }
