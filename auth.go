@@ -18,6 +18,19 @@ type Credential struct {
 	IdentityToken string
 }
 
+// ErrRefused is wrapped by the error of a registry that refused the login,
+// or refused access to the image: a login, or another one, may help.
+var ErrRefused = errors.New("access refused")
+
+// refusedError marks a registry's refusal without changing its message.
+type refusedError struct{ err error }
+
+func (e refusedError) Error() string        { return e.err.Error() }
+func (e refusedError) Unwrap() error        { return e.err }
+func (e refusedError) Is(target error) bool { return target == ErrRefused }
+
+func refused(err error) error { return refusedError{err} }
+
 // credential asks Options.Credentials for the login of r's registry. No
 // callback means anonymous.
 func (u *upstream) credential(ctx context.Context, r remote) (Credential, error) {

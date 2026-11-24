@@ -229,7 +229,7 @@ func (p *proxy) refuse(status string, body []byte) {
 	if msg != "" {
 		msg = ": " + msg
 	}
-	p.fail(permanent(fmt.Errorf("registry %s refused access to %s: %s%s", p.t.remote.registry, p.t.path, status, msg)))
+	p.fail(permanent(refused(fmt.Errorf("registry %s refused access to %s: %s%s", p.t.remote.registry, p.t.path, status, msg))))
 }
 
 // recordManifest notes a manifest as part of this pull's image along with

@@ -133,7 +133,7 @@ func (u *upstream) registryDo(ctx context.Context, method, rawURL string, header
 		return resp, err
 	}
 	drain(resp)
-	return nil, permanent(fmt.Errorf("registry %s refused the login for %s: %s", r.registry, basicUser, resp.Status))
+	return nil, permanent(refused(fmt.Errorf("registry %s refused the login for %s: %s", r.registry, basicUser, resp.Status)))
 }
 
 // token runs the token exchange a bearer challenge names: an OAuth2
@@ -162,16 +162,16 @@ func (u *upstream) token(ctx context.Context, ch challenge, r remote, cred Crede
 		return "", fmt.Errorf("token request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	refused := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
+	denied := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
 	switch {
 	// OAuth2 answers an expired or revoked refresh token with 400
 	// invalid_grant.
-	case cred.IdentityToken != "" && (refused || resp.StatusCode == http.StatusBadRequest):
-		return "", permanent(fmt.Errorf("registry %s refused the login with the identity token: %s", r.registry, resp.Status))
-	case cred.Username != "" && refused:
-		return "", permanent(fmt.Errorf("registry %s refused the login for %s: %s", r.registry, cred.Username, resp.Status))
-	case refused:
-		return "", permanent(fmt.Errorf("registry %s refused access to %s: %s", r.registry, r.repo, resp.Status))
+	case cred.IdentityToken != "" && (denied || resp.StatusCode == http.StatusBadRequest):
+		return "", permanent(refused(fmt.Errorf("registry %s refused the login with the identity token: %s", r.registry, resp.Status)))
+	case cred.Username != "" && denied:
+		return "", permanent(refused(fmt.Errorf("registry %s refused the login for %s: %s", r.registry, cred.Username, resp.Status)))
+	case denied:
+		return "", permanent(refused(fmt.Errorf("registry %s refused access to %s: %s", r.registry, r.repo, resp.Status)))
 	case resp.StatusCode != http.StatusOK:
 		return "", fmt.Errorf("token request: %s", resp.Status)
 	}

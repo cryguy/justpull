@@ -42,27 +42,38 @@ type event struct {
 	Event    string `json:"event"`
 	LocalRef string `json:"localRef"`
 	Error    string `json:"error"`
+	Refused  bool   `json:"refused"`
 	Success  *bool  `json:"success"`
+	ID       string `json:"id"`
+	Offset   int64  `json:"offset"`
 }
 
-// served is a serve run on pipes, driven as the host CLI drives it.
+// served is a serve run on pipes, driven as the host CLI drives it. Retry
+// events, which come whenever a download resumes, are kept apart.
 type served struct {
-	t      *testing.T
-	stdin  *io.PipeWriter
-	events chan event
-	stdout syncBuffer
-	stderr syncBuffer
-	done   chan struct{}
-	code   int
+	t       *testing.T
+	stdin   *io.PipeWriter
+	events  chan event
+	stdout  syncBuffer
+	stderr  syncBuffer
+	done    chan struct{}
+	code    int
+	mu      sync.Mutex
+	retries []event
 }
 
 func startServe(t *testing.T, dir string) *served {
+	t.Helper()
+	return startServeCtx(t, context.Background(), dir)
+}
+
+func startServeCtx(t *testing.T, ctx context.Context, dir string) *served {
 	t.Helper()
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
 	s := &served{t: t, stdin: inW, events: make(chan event, 16), done: make(chan struct{})}
 	go func() {
-		s.code = serve(context.Background(), []string{"--cache", dir}, inR, outW, &s.stderr)
+		s.code = serve(ctx, []string{"--cache", dir}, inR, outW, &s.stderr)
 		close(s.done)
 		_ = outW.Close()
 	}()
@@ -73,6 +84,12 @@ func startServe(t *testing.T, dir string) *served {
 			var e event
 			if err := json.Unmarshal(lines.Bytes(), &e); err != nil {
 				e = event{Event: "not JSON: " + lines.Text()}
+			}
+			if e.Event == "retry" {
+				s.mu.Lock()
+				s.retries = append(s.retries, e)
+				s.mu.Unlock()
+				continue
 			}
 			s.events <- e
 		}
@@ -234,8 +251,8 @@ func TestServeReportsAFailedLayerAndKeepsNothingCorrupt(t *testing.T) {
 	pulled := make(chan error, 1)
 	go func() { pulled <- dockerPull(ctx, fakedocker.New(), ready.LocalRef) }()
 
-	if e := s.next("failed"); !strings.Contains(e.Error, "digest mismatch") {
-		t.Fatalf("failed event %+v, want the digest mismatch", e)
+	if e := s.next("failed"); !strings.Contains(e.Error, "digest mismatch") || e.Refused {
+		t.Fatalf("failed event %+v, want the digest mismatch, not refused", e)
 	}
 	cancel() // as the host does on a failed event
 	if err := <-pulled; err == nil {
@@ -293,6 +310,69 @@ func TestServeEndsAsFailedWhenStdinEnds(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("docker's pull did not end with the session")
+	}
+}
+
+func TestServeSendsARetryEventWhenADownloadResumes(t *testing.T) {
+	reg := fakereg.New(t)
+	img := reg.AddImage("team/app", "v1", 300_000)
+	layer := img.Layers[0]
+	layer.Faults(fakereg.Cut)
+	dir := t.TempDir()
+	s := startServe(t, dir)
+
+	s.send(`{"ref":"` + reg.Host + `/team/app:v1"}`)
+	ready := s.next("ready")
+	if err := dockerPull(context.Background(), fakedocker.New(), ready.LocalRef); err != nil {
+		t.Fatal(err)
+	}
+	s.finish(true)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := event{Event: "retry", ID: strings.TrimPrefix(layer.Digest, "sha256:")[:12], Offset: int64(len(layer.Data) / 2)}
+	if len(s.retries) != 1 || s.retries[0] != want {
+		t.Fatalf("retry events %+v, want one %+v", s.retries, want)
+	}
+	if !strings.Contains(s.stderr.String(), `"msg":"layer download broke, retrying"`) {
+		t.Fatalf("the warning is no longer on stderr: %s", s.stderr.String())
+	}
+}
+
+func TestServeMarksARefusalInTheFailedEvent(t *testing.T) {
+	reg := fakereg.New(t)
+	reg.TokenTTL = time.Hour
+	reg.Username, reg.Password = "alice", secret
+	reg.AddImage("team/app", "v1", 100_000)
+	s := startServe(t, t.TempDir())
+
+	s.send(`{"ref":"` + reg.Host + `/team/app:v1","credential":{"username":"alice","password":"wrong"}}`)
+	ready := s.next("ready")
+	pulled := make(chan error, 1)
+	go func() { pulled <- dockerPull(context.Background(), fakedocker.New(), ready.LocalRef) }()
+	if e := s.next("failed"); !e.Refused || !strings.Contains(e.Error, "refused the login for alice") {
+		t.Fatalf("failed event %+v, want a refused login", e)
+	}
+	if err := <-pulled; err == nil {
+		t.Fatal("docker's pull succeeded")
+	}
+	s.finish(false)
+}
+
+func TestServeEndsAsFailedWhenItsContextEnds(t *testing.T) {
+	reg := fakereg.New(t)
+	reg.AddImage("team/app", "v1", 400_000)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := startServeCtx(t, ctx, t.TempDir())
+
+	s.send(`{"ref":"` + reg.Host + `/team/app:v1"}`)
+	s.next("ready")
+	cancel() // as SIGINT or SIGTERM do
+	if e := s.next("finished"); e.Success == nil || *e.Success {
+		t.Fatalf("finished event %+v, want success false", e)
+	}
+	if code := s.exit(); code != 0 {
+		t.Fatalf("exit code %d, want 0", code)
 	}
 }
 

@@ -417,7 +417,7 @@ func (c *Cache) download(ctx context.Context, b *blob, fetch fetchFunc) error {
 		}
 		if start > offset {
 			_ = body.Close()
-			c.opts.Logger.Warn("registry answered from the wrong offset, retrying", "digest", b.hex[:12], "asked", offset, "got", start)
+			c.opts.Logger.Warn("registry answered from the wrong offset, retrying", "digest", b.hex[:12], "offset", offset, "got", start)
 			c.sleep(ctx, &wait, lastProgress)
 			continue
 		}
@@ -430,11 +430,11 @@ func (c *Cache) download(ctx context.Context, b *blob, fetch fetchFunc) error {
 		if offset == size {
 			break
 		}
+		c.opts.Logger.Warn("layer download broke, retrying", "digest", b.hex[:12], "offset", offset, "err", err)
 		if n > 0 {
 			wait = c.retryBase
 			continue
 		}
-		c.opts.Logger.Warn("layer download broke, retrying", "digest", b.hex[:12], "offset", offset, "err", err)
 		c.sleep(ctx, &wait, lastProgress)
 	}
 

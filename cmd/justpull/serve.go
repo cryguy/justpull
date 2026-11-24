@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/distribution/reference"
@@ -45,7 +46,9 @@ type command struct {
 
 // serve runs one Session for the CLI on the host, which makes the Docker
 // calls: the request is the first line on stdin, the events go to stdout as
-// one JSON object per line, warnings go to stderr. It returns the exit code.
+// one JSON object per line, warnings go to stderr. ctx ending (on SIGINT or
+// SIGTERM) ends the session as failed, as stdin ending does. It returns the
+// exit code.
 func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -58,27 +61,27 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 		fmt.Fprint(stderr, usage)
 		return 2
 	}
-	events := json.NewEncoder(stdout)
+	events := &eventWriter{enc: json.NewEncoder(stdout)}
 	lines := bufio.NewScanner(stdin)
 
 	req, opts, msg := readRequest(lines)
 	if msg != "" {
-		sendFailed(events, msg)
+		events.failed(msg, false)
 		return 1
 	}
-	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+	logger := slog.New(retryHandler{slog.NewJSONHandler(stderr, nil), events})
 	opts.Logger = logger
 	cache, err := justpull.New(*dir, opts)
 	if err != nil {
-		sendFailed(events, err.Error())
+		events.failed(err.Error(), false)
 		return 1
 	}
 	s, err := cache.Serve(ctx, req.Ref, justpull.SessionOptions{AllTags: req.AllTags})
 	if err != nil {
-		sendFailed(events, err.Error())
+		events.failed(err.Error(), false)
 		return 1
 	}
-	_ = events.Encode(struct {
+	events.send(struct {
 		Event    string `json:"event"`
 		LocalRef string `json:"localRef"`
 	}{"ready", s.LocalRef()})
@@ -89,7 +92,10 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 	select {
 	case <-s.Context().Done():
 		sendCause(s.Context(), events)
-		success = <-finish
+		select {
+		case success = <-finish:
+		case <-ctx.Done():
+		}
 	case success = <-finish:
 		// A layer can fail while the host's finish is on its way.
 		sendCause(s.Context(), events)
@@ -97,11 +103,74 @@ func serve(ctx context.Context, args []string, stdin io.Reader, stdout, stderr i
 	if err := s.Finish(success); err != nil {
 		logger.Warn("could not delete cached files", "err", err)
 	}
-	_ = events.Encode(struct {
+	events.send(struct {
 		Event   string `json:"event"`
 		Success bool   `json:"success"`
 	}{"finished", success})
 	return 0
+}
+
+// eventWriter writes the events, one JSON object per line. Downloads send
+// retry events from their own goroutines.
+type eventWriter struct {
+	mu  sync.Mutex
+	enc *json.Encoder
+}
+
+func (w *eventWriter) send(event any) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.enc.Encode(event)
+}
+
+// failed sends the failed event. refused tells the host that a login, or
+// another one, may help.
+func (w *eventWriter) failed(msg string, refused bool) {
+	w.send(struct {
+		Event   string `json:"event"`
+		Error   string `json:"error"`
+		Refused bool   `json:"refused,omitempty"`
+	}{"failed", msg, refused})
+}
+
+// retryHandler also sends a retry event for every warning that carries a
+// layer's short digest and the offset its download resumes from.
+type retryHandler struct {
+	slog.Handler
+	events *eventWriter
+}
+
+func (h retryHandler) Handle(ctx context.Context, r slog.Record) error {
+	if r.Level == slog.LevelWarn {
+		var id string
+		var offset int64
+		var hasID, hasOffset bool
+		r.Attrs(func(a slog.Attr) bool {
+			switch {
+			case a.Key == "digest" && a.Value.Kind() == slog.KindString:
+				id, hasID = a.Value.String(), true
+			case a.Key == "offset" && a.Value.Kind() == slog.KindInt64:
+				offset, hasOffset = a.Value.Int64(), true
+			}
+			return true
+		})
+		if hasID && hasOffset {
+			h.events.send(struct {
+				Event  string `json:"event"`
+				ID     string `json:"id"`
+				Offset int64  `json:"offset"`
+			}{"retry", id, offset})
+		}
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h retryHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return retryHandler{h.Handler.WithAttrs(attrs), h.events}
+}
+
+func (h retryHandler) WithGroup(name string) slog.Handler {
+	return retryHandler{h.Handler.WithGroup(name), h.events}
 }
 
 // readRequest reads the request from the first line. msg is one of the
@@ -156,15 +225,8 @@ func awaitFinish(lines *bufio.Scanner, logger *slog.Logger) bool {
 
 // sendCause sends the failed event when the session ended with a failure
 // rather than a cancel. The host then cancels Docker's pull.
-func sendCause(ctx context.Context, events *json.Encoder) {
+func sendCause(ctx context.Context, events *eventWriter) {
 	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
-		sendFailed(events, cause.Error())
+		events.failed(cause.Error(), errors.Is(cause, justpull.ErrRefused))
 	}
-}
-
-func sendFailed(events *json.Encoder, msg string) {
-	_ = events.Encode(struct {
-		Event string `json:"event"`
-		Error string `json:"error"`
-	}{"failed", msg})
 }

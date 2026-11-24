@@ -452,7 +452,7 @@ func TestWrongLoginFailsAtOnce(t *testing.T) {
 
 			start := time.Now()
 			err := pullWith(t, reg, creds.credentials)
-			if err == nil || !isPermanent(err) || !strings.Contains(err.Error(), "refused the login") {
+			if err == nil || !isPermanent(err) || !strings.Contains(err.Error(), "refused the login") || !errors.Is(err, ErrRefused) {
 				t.Fatalf("err = %v, want a permanent refused login", err)
 			}
 			if strings.Contains(err.Error(), tc.secret) {
@@ -471,7 +471,7 @@ func TestPrivateRegistryWithoutCredentialsIsRefused(t *testing.T) {
 			reg := privateRegistry(t, tokenTTL)
 
 			err := pullWith(t, reg, nil)
-			if err == nil || !isPermanent(err) || !strings.Contains(err.Error(), "refused access to team/app") {
+			if err == nil || !isPermanent(err) || !strings.Contains(err.Error(), "refused access to team/app") || !errors.Is(err, ErrRefused) {
 				t.Fatalf("err = %v, want the registry's refusal", err)
 			}
 		})

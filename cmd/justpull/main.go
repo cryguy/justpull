@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"syscall"
 
 	// The container image is scratch, without a CA bundle. This embeds
 	// Mozilla's roots, which Go uses only when the system has none.
@@ -26,7 +28,10 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "serve" {
-		return serve(context.Background(), args[1:], stdin, stdout, stderr)
+		// docker run forwards these to the container.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return serve(ctx, args[1:], stdin, stdout, stderr)
 	}
 	fmt.Fprint(stderr, usage)
 	return 2
