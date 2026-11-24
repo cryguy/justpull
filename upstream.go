@@ -33,11 +33,14 @@ type upstream struct {
 	tokens map[string]string // "<host>/<repo>" -> Authorization value
 }
 
+// newUpstream speaks HTTP/1.1 only, as dockerd does to registries. Each
+// layer then has its own connection, so closing a stuck body drops that
+// connection and the retry dials a fresh one; over HTTP/2 the retry would
+// share the stuck connection with every other layer.
 func newUpstream() *upstream {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
