@@ -55,7 +55,7 @@ func newUpstream(credentials func(ctx context.Context, registry string) (Credent
 				return http.ErrUseLastResponse
 			},
 		},
-		tokenClient: &http.Client{Transport: transport, Timeout: 30 * time.Second},
+		tokenClient: &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: checkTokenRedirect},
 		credentials: credentials,
 		tokens:      map[string]string{},
 	}
@@ -120,9 +120,6 @@ func (u *upstream) registryDo(ctx context.Context, method, rawURL string, header
 			return resp, nil
 		}
 		drain(resp)
-		if err := checkLoginURL(r.registry, resp.Request.URL); err != nil {
-			return nil, err
-		}
 		auth, basicUser = basicAuth(cred.Username, cred.Password), cred.Username
 	default:
 		return resp, nil

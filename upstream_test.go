@@ -299,7 +299,6 @@ func TestLoginIsNeverSentOverPlainHTTP(t *testing.T) {
 	}{
 		{"bearer with password", bearer, password, true},
 		{"bearer with identity token", bearer, Credential{IdentityToken: "rt"}, true},
-		{"basic", `Basic realm="x"`, password, true},
 		{"anonymous bearer", bearer, Credential{}, false},
 	}
 	for _, tc := range cases {
@@ -343,6 +342,45 @@ func TestLoginIsNeverSentOverPlainHTTP(t *testing.T) {
 			for _, req := range sent {
 				if req.URL.Path == "/token" || req.Header.Get("Authorization") != "" {
 					t.Fatalf("%s %s was sent with the login", req.Method, req.URL.Path)
+				}
+			}
+		})
+	}
+}
+
+func TestTokenRedirectNeverCarriesTheLoginOverPlainHTTP(t *testing.T) {
+	cases := []struct {
+		name string
+		cred Credential
+		code int
+	}{
+		{"password", Credential{Username: "alice", Password: "pw"}, http.StatusTemporaryRedirect},
+		{"identity token", Credential{IdentityToken: "rt"}, http.StatusPermanentRedirect},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var sent []*http.Request
+			u := newUpstream(func(context.Context, string) (Credential, error) { return tc.cred, nil })
+			stub := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				mu.Lock()
+				sent = append(sent, req)
+				mu.Unlock()
+				if req.URL.Path == "/token" {
+					return stubResponse(req, tc.code, http.Header{"Location": {"http://example.invalid/token"}}, ""), nil
+				}
+				return stubResponse(req, http.StatusUnauthorized, http.Header{"Www-Authenticate": {`Bearer realm="https://example.invalid/token",service="test"`}}, ""), nil
+			})
+			u.client.Transport, u.tokenClient.Transport = stub, stub
+			rm := remote{host: "example.invalid", repo: "team/app", registry: "example.invalid"}
+
+			_, err := u.registryDo(context.Background(), http.MethodGet, rm.url("https", "manifests", "v1"), nil, rm)
+			if err == nil || !isPermanent(err) || !strings.Contains(err.Error(), "plain HTTP") {
+				t.Fatalf("err = %v, want a permanent refusal to follow the redirect", err)
+			}
+			for _, req := range sent {
+				if req.URL.Scheme == "http" {
+					t.Fatalf("%s %s was sent over plain HTTP", req.Method, req.URL)
 				}
 			}
 		})

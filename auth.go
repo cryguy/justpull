@@ -3,7 +3,9 @@ package justpull
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 )
 
@@ -37,6 +39,22 @@ func checkLoginURL(registry string, dest *url.URL) error {
 		return nil
 	}
 	return permanent(fmt.Errorf("registry %s: refusing to send the login over plain HTTP to %s", registry, dest.Host))
+}
+
+// checkTokenRedirect keeps a token request's login off plain HTTP when the
+// token endpoint redirects: Go resends a POST body on 307 and 308, and an
+// Authorization header to the same host whatever the scheme.
+func checkTokenRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if req.Method != http.MethodPost && req.Header.Get("Authorization") == "" {
+		return nil
+	}
+	if req.URL.Scheme != "http" || isLoopback(req.URL.Hostname()) {
+		return nil
+	}
+	return permanent(fmt.Errorf("refusing to follow a redirect that sends the login over plain HTTP to %s", req.URL.Host))
 }
 
 func basicAuth(username, password string) string {
