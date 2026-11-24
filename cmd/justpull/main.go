@@ -1,6 +1,6 @@
 // Command justpull is docker pull through a cache that keeps every downloaded
-// byte, so a broken pull continues where it stopped. justpull serve runs the
-// proxy of one pull in a container, driven by the CLI on the host.
+// byte, so a broken pull continues where it stopped. justpull --serve runs
+// the proxy of one pull in a container, driven by the CLI on the host.
 package main
 
 import (
@@ -16,10 +16,10 @@ import (
 	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
-const usage = `usage: justpull serve [--cache DIR]
+const usage = `usage: justpull --serve [--cache DIR]
 
-serve runs the proxy of one pull for the justpull CLI, which drives it over
-stdin and stdout. DIR is the cache directory, /cache by default.
+--serve runs the proxy of one pull for the justpull CLI, which drives it
+over stdin and stdout. DIR is the cache directory, /cache by default.
 `
 
 func main() {
@@ -27,7 +27,10 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) > 0 && args[0] == "serve" {
+	// A flag, unlike a word, can never be an image name, so justpull serve
+	// pulls the image serve as docker pull does. It is not in the pull
+	// command's options, so --help shows docker pull's usage unchanged.
+	if len(args) > 0 && args[0] == "--serve" {
 		// docker run forwards these to the container.
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()

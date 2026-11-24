@@ -18,7 +18,7 @@ import (
 type dockerAPI interface {
 	// EnsureProxy makes the proxy image present and returns its reference.
 	EnsureProxy(ctx context.Context, progress io.Writer) (string, error)
-	// StartProxy runs justpull serve from image.
+	// StartProxy runs justpull --serve from image.
 	StartProxy(image string) (*proxyProc, error)
 	Pull(ctx context.Context, image, tag, platform string, allTags bool, auth *engine.RegistryAuth) (io.ReadCloser, error)
 	Tag(ctx context.Context, source, target string) error
@@ -28,7 +28,7 @@ type dockerAPI interface {
 	TagIDs(ctx context.Context, repo string) (map[string]string, error)
 }
 
-// proxyProc is a running justpull serve.
+// proxyProc is a running justpull --serve.
 type proxyProc struct {
 	stdin  io.WriteCloser
 	stdout io.Reader
@@ -94,7 +94,7 @@ func proxyArgs(image, name string) []string {
 		"--network", "host",
 		"--user", "65534:65534", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
 		"-v", "justpull-cache:/cache",
-		image, "serve", "--cache", "/cache",
+		image, "--serve", "--cache", "/cache",
 	}
 }
 

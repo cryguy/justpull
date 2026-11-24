@@ -484,10 +484,10 @@ func TestServeRefusesABadRequest(t *testing.T) {
 
 func TestServeWithArgumentsPrintsItsUsage(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"serve", "extra"}, strings.NewReader(""), &stdout, &stderr); code != 2 {
+	if code := run([]string{"--serve", "extra"}, strings.NewReader(""), &stdout, &stderr); code != 2 {
 		t.Errorf("exit code %d, want 2", code)
 	}
-	if !strings.HasPrefix(stderr.String(), "usage: justpull serve") || stdout.Len() != 0 {
+	if !strings.HasPrefix(stderr.String(), "usage: justpull --serve") || stdout.Len() != 0 {
 		t.Errorf("stdout %q, stderr %q; want the usage on stderr", stdout.String(), stderr.String())
 	}
 }

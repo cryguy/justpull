@@ -116,7 +116,7 @@ when a layer fails for good; cancel Docker's pull then. Tag the image and end
 with `s.Finish(success)`, which deletes the image's cached files only on
 success.
 
-`cmd/justpull serve` runs a session over stdin and stdout for the justpull CLI.
+`justpull --serve` runs a session over stdin and stdout for the justpull CLI.
 
 ### Behaviour
 

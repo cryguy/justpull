@@ -667,7 +667,7 @@ func TestIDRenamerNamesTheReferenceAsDockerd(t *testing.T) {
 }
 
 func TestProxyArgs(t *testing.T) {
-	want := "run -i --rm --pull never --name justpull-0a1b2c3d --network host --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges --read-only -v justpull-cache:/cache ghcr.io/cryguy/justpull:v1 serve --cache /cache"
+	want := "run -i --rm --pull never --name justpull-0a1b2c3d --network host --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges --read-only -v justpull-cache:/cache ghcr.io/cryguy/justpull:v1 --serve --cache /cache"
 	if got := strings.Join(proxyArgs("ghcr.io/cryguy/justpull:v1", "justpull-0a1b2c3d"), " "); got != want {
 		t.Fatalf("docker %s\nwant   %s", got, want)
 	}
