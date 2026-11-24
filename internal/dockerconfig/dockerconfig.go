@@ -50,7 +50,7 @@ type Config struct {
 	credsStore  string
 	credHelpers map[string]string
 	env         map[string]justpull.Credential
-	envErr      error
+	warnings    []string
 }
 
 type envFile struct {
@@ -81,7 +81,8 @@ type helperOutput struct {
 
 // Load reads the docker CLI's config: $DOCKER_CONFIG/config.json, else
 // ~/.docker/config.json. A missing file is an empty config. A malformed
-// DOCKER_AUTH_CONFIG is reported by Credential.
+// DOCKER_AUTH_CONFIG is ignored, as the docker CLI ignores it, and reported
+// by Warnings.
 func Load() (*Config, error) {
 	dir := os.Getenv("DOCKER_CONFIG")
 	if dir == "" {
@@ -96,9 +97,19 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if v := os.Getenv(envKey); v != "" {
-		c.env, c.envErr = parseEnv(v)
+		env, err := parseEnv(v)
+		if err != nil {
+			c.warnings = append(c.warnings, "Failed to create credential store from "+envKey+": "+err.Error())
+		}
+		c.env = env
 	}
 	return c, nil
+}
+
+// Warnings returns the lines the docker CLI prints on stderr for this
+// config. They never quote a login.
+func (c *Config) Warnings() []string {
+	return slices.Clone(c.warnings)
 }
 
 // parseEnv reads DOCKER_AUTH_CONFIG. Its errors never quote the value.
@@ -107,20 +118,20 @@ func parseEnv(v string) (map[string]justpull.Credential, error) {
 	dec := json.NewDecoder(strings.NewReader(v))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil && !errors.Is(err, io.EOF) {
-		return nil, errors.New(envKey + ` is not JSON of the form {"auths":{"<registry>":{"auth":"<base64 user:password>"}}}`)
+		return nil, errors.New(`the value is not JSON of the form {"auths":{"<registry>":{"auth":"<base64 user:password>"}}}`)
 	}
 	if dec.More() {
-		return nil, errors.New(envKey + " holds more than one JSON object")
+		return nil, errors.New(envKey + " does not support more than one JSON object")
 	}
 	creds := make(map[string]justpull.Credential, len(f.Auths))
 	for _, addr := range slices.Sorted(maps.Keys(f.Auths)) {
 		auth := f.Auths[addr].Auth
 		if auth == "" {
-			return nil, fmt.Errorf("%s has no auth for %s", envKey, addr)
+			return nil, fmt.Errorf("%s environment variable is missing key `auth` for %s", envKey, addr)
 		}
 		username, password, err := decodeAuth(auth)
 		if err != nil {
-			return nil, fmt.Errorf("%s: the auth for %s %w", envKey, addr, err)
+			return nil, fmt.Errorf("the auth for %s %w", addr, err)
 		}
 		creds[addr] = justpull.Credential{Username: username, Password: password}
 	}
@@ -191,9 +202,6 @@ func platformStore() string {
 // Credential and a nil error.
 func (c *Config) Credential(ctx context.Context, registry string) (justpull.Credential, error) {
 	addr := serverAddress(registry)
-	if c.envErr != nil {
-		return justpull.Credential{}, c.envErr
-	}
 	if cred, ok := c.env[addr]; ok {
 		return cred, nil
 	}

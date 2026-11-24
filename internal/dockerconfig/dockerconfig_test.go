@@ -395,8 +395,23 @@ func TestAuthConfigEnvFallsBack(t *testing.T) {
 	}
 }
 
-func TestMalformedAuthConfigEnvIsAnErrorWithoutTheValue(t *testing.T) {
+func TestAuthConfigEnvWarnsOnlyWhenMalformed(t *testing.T) {
+	writeConfig(t, `{}`)
+	for _, env := range []string{"", `{"auths":{"ghcr.io":{"auth":"` + basic("u", "p") + `"}}}`, "  "} {
+		t.Setenv("DOCKER_AUTH_CONFIG", env)
+		c, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := c.Warnings(); len(w) != 0 {
+			t.Errorf("env %q: warnings %q", env, w)
+		}
+	}
+}
+
+func TestMalformedAuthConfigEnvIsIgnoredWithAWarning(t *testing.T) {
 	writeConfig(t, `{"auths":{"ghcr.io":{"auth":"`+basic("file", "pw-file")+`"}}}`)
+	fromFile := justpull.Credential{Username: "file", Password: "pw-file"}
 	secret := basic("user", "hunter2")
 	cases := map[string]string{
 		"not JSON":           `{"auths":{"ghcr.io":{"auth":"` + secret + `"`,
@@ -412,19 +427,28 @@ func TestMalformedAuthConfigEnvIsAnErrorWithoutTheValue(t *testing.T) {
 	for name, env := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Setenv("DOCKER_AUTH_CONFIG", env)
-			_, err := credential(t, "ghcr.io")
-			if err == nil {
-				t.Fatal("no error")
+			c, err := Load()
+			if err != nil {
+				t.Fatal(err)
 			}
-			msg := err.Error()
-			if !strings.Contains(msg, "DOCKER_AUTH_CONFIG") {
-				t.Fatalf("the error does not name DOCKER_AUTH_CONFIG: %v", msg)
+			got, err := c.Credential(context.Background(), "ghcr.io")
+			if err != nil || got != fromFile {
+				t.Fatalf("got %+v, %v; want the config file's login", got, err)
+			}
+			warnings := c.Warnings()
+			if len(warnings) != 1 {
+				t.Fatalf("warnings %q, want one", warnings)
+			}
+			msg := warnings[0]
+			if !strings.HasPrefix(msg, "Failed to create credential store from DOCKER_AUTH_CONFIG: ") {
+				t.Fatalf("the warning is not docker's: %q", msg)
 			}
 			for _, leak := range []string{"hunter2", secret, "12345", "aHVudGVyMg", "'h'", "'u'"} {
 				if strings.Contains(msg, leak) {
-					t.Fatalf("the error quotes %q: %v", leak, msg)
+					t.Fatalf("the warning quotes %q: %q", leak, msg)
 				}
 			}
+			t.Logf("%s", msg)
 		})
 	}
 }
