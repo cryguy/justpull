@@ -648,6 +648,24 @@ func TestRenamerHidesTheProxy(t *testing.T) {
 	}
 }
 
+func TestIDRenamerNamesTheReferenceAsDockerd(t *testing.T) {
+	const dgst = "sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d"
+	tests := []struct{ local, user, id, want string }{
+		{"127.0.0.1:41234/library/alpine@" + dgst, "alpine@" + dgst, "127.0.0.1:41234/library/alpine@" + dgst, "docker.io/library/alpine@" + dgst},
+		{"127.0.0.1:39869/e2e/pinned@" + dgst, "127.0.0.1:44627/e2e/pinned@" + dgst, "127.0.0.1:39869/e2e/pinned@" + dgst, "127.0.0.1:44627/e2e/pinned@" + dgst},
+		{"127.0.0.1:41234/library/alpine:3.20", "alpine:3.20", "3.20", "3.20"},
+		{"127.0.0.1:41234/library/alpine:latest", "alpine:latest", "latest", "latest"},
+		{"127.0.0.1:41234/library/alpine@" + dgst, "alpine@" + dgst, "0a9a5dfd008f", "0a9a5dfd008f"},
+	}
+	for _, tt := range tests {
+		local, _ := reference.ParseNormalizedNamed(tt.local)
+		user, _ := reference.ParseNormalizedNamed(tt.user)
+		if got := idRenamer(local, user)(tt.id); got != tt.want {
+			t.Errorf("idRenamer(%s, %s)(%q) = %q, want %q", tt.local, tt.user, tt.id, got, tt.want)
+		}
+	}
+}
+
 func TestProxyArgs(t *testing.T) {
 	want := "run -i --rm --pull never --name justpull-0a1b2c3d --network host --user 65534:65534 --cap-drop ALL --security-opt no-new-privileges --read-only -v justpull-cache:/cache ghcr.io/cryguy/justpull:v1 serve --cache /cache"
 	if got := strings.Join(proxyArgs("ghcr.io/cryguy/justpull:v1", "justpull-0a1b2c3d"), " "); got != want {

@@ -1,0 +1,4 @@
+docker.io/library/alpine@sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d: Pulling from library/alpine
+
+[1A[2K0a9a5dfd008f: Pulling fs layer [1B[1A[2K0a9a5dfd008f: Download complete [1B[1A[2K0a9a5dfd008f: Pull complete [1BDigest: sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d
+Status: Downloaded newer image for alpine@sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d

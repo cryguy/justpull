@@ -18,8 +18,12 @@ import (
 // streams naming the real image, non-TTY and in a pty of the width in the
 // file name. hello.json is a real pull of hello-world on the containerd
 // store, whose non-TTY golden matches the docker CLI's own output byte for
-// byte.
-var rename = strings.NewReplacer("127.0.0.1:41234/library/", "").Replace
+// byte. dockerd writes a digest pull's reference in full as its first
+// message's id, so renameID maps the address to docker.io.
+var (
+	rename   = strings.NewReplacer("127.0.0.1:41234/library/", "").Replace
+	renameID = strings.NewReplacer("127.0.0.1:41234/", "docker.io/").Replace
+)
 
 func fixture(t *testing.T, name string) string {
 	t.Helper()
@@ -52,11 +56,15 @@ func TestRenderGolden(t *testing.T) {
 		{"error.json", true, 200, "error.tty200.golden", pullErr},
 		{"alltags.json", false, 0, "alltags.notty.golden", ""},
 		{"alltags.json", true, 200, "alltags.tty200.golden", ""},
+		{"digest.json", false, 0, "digest.notty.golden", ""},
+		{"digest.json", true, 200, "digest.tty200.golden", ""},
 	}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("%s/tty=%v/width=%d", tt.stream, tt.tty, tt.width), func(t *testing.T) {
 			var out bytes.Buffer
-			err := newRenderer(&out, tt.tty, tt.width, false, rename).render(strings.NewReader(fixture(t, tt.stream)))
+			r := newRenderer(&out, tt.tty, tt.width, false, rename)
+			r.renameID = renameID
+			err := r.render(strings.NewReader(fixture(t, tt.stream)))
 			if got := errText(err); got != tt.wantErr {
 				t.Fatalf("render error = %q, want %q", got, tt.wantErr)
 			}

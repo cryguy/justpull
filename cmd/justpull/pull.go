@@ -280,6 +280,7 @@ func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred just
 	}
 	rename := renamer(local, p.named)
 	r := newRenderer(p.e.stdout, p.e.tty, p.e.width, p.opts.quiet, rename)
+	r.renameID = idRenamer(local, p.named)
 	pullCtx, cancelPull := context.WithCancel(ctx)
 	defer cancelPull()
 	if !p.opts.quiet {
@@ -410,6 +411,13 @@ func renamer(local, user reference.Named) func(string) string {
 		host = "registry-1.docker.io"
 	}
 	return strings.NewReplacer(local.Name(), reference.FamiliarName(user), reference.Domain(local), host).Replace
+}
+
+// idRenamer maps a message id that names the local reference to the user's
+// reference in full, as dockerd writes it: a digest pull's "Pulling from"
+// message has the pulled reference as its id.
+func idRenamer(local, user reference.Named) func(string) string {
+	return strings.NewReplacer(local.Name(), user.Name()).Replace
 }
 
 func tagOrDigest(ref reference.Named) string {

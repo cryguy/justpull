@@ -20,6 +20,10 @@ type renderer struct {
 	width  int
 	rename func(string) string
 	now    func() time.Time
+	// renameID, if set, maps a message's id to what the user pulled. A
+	// digest pull's first message has the local reference as its id. Set it
+	// before render.
+	renameID func(string) string
 	// upToDate, if set, reports whether docker pull would find the user's
 	// name ref (as the status line names it, renamed) up to date. It may
 	// call Docker. Set it before render.
@@ -90,6 +94,9 @@ func (r *renderer) render(stream io.Reader) error {
 			return fmt.Errorf("read docker pull stream: %w", err)
 		}
 		m.Status, m.Stream = r.rename(m.Status), r.rename(m.Stream)
+		if r.renameID != nil {
+			m.ID = r.renameID(m.ID)
+		}
 		r.status(&m)
 		r.mu.Lock()
 		err := r.show(m)

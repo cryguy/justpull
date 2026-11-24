@@ -1,0 +1,6 @@
+{"status":"Pulling from library/alpine","id":"127.0.0.1:41234/library/alpine@sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d"}
+{"status":"Pulling fs layer","progressDetail":{},"id":"0a9a5dfd008f"}
+{"status":"Download complete","progressDetail":{"hidecounts":true},"id":"0a9a5dfd008f"}
+{"status":"Pull complete","progressDetail":{"hidecounts":true},"id":"0a9a5dfd008f"}
+{"status":"Digest: sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d"}
+{"status":"Status: Downloaded newer image for 127.0.0.1:41234/library/alpine@sha256:beefdbd8a1da6d2915566fde36db9db0b524eb737fc57cd1367effd16dc0d06d"}
