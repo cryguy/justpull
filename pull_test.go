@@ -550,6 +550,7 @@ func TestProxyServesOnlyItsRepository(t *testing.T) {
 	srv := httptest.NewServer(newProxy(ctx, c, tgt, cancel))
 	defer srv.Close()
 
+	// The upstream 127.0.0.1:1 is closed, so a request relayed to it is a 502.
 	for path, want := range map[string]int{
 		"/v2/":                         200,
 		"/v2/other/app/manifests/v1":   404,
@@ -558,6 +559,9 @@ func TestProxyServesOnlyItsRepository(t *testing.T) {
 		"/v2/team/app/blobs/sha512:ab": 404,
 		"/v2/team/app/nope":            404,
 		"/nope":                        404,
+		"/v2/team/app/manifests/..%2F..%2Fother%2Fapp%2Fblobs%2Fsha256:ab": 404,
+		"/v2/team/app/manifests/v1%3Fn=1":                                  404,
+		"/v2/team/app/manifests/..":                                        404,
 	} {
 		resp, err := http.Get(srv.URL + path)
 		if err != nil {

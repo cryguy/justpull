@@ -7,9 +7,12 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/distribution/reference"
 )
 
 // maxManifestBytes caps a relayed manifest or tag list page, matching the
@@ -76,6 +79,11 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ref, ok := strings.CutPrefix(route, "manifests/"); ok {
+		// The reference goes into the registry URL, with the login.
+		if !manifestRef.MatchString(ref) {
+			writeError(w, http.StatusNotFound, "MANIFEST_UNKNOWN", "not a tag or digest")
+			return
+		}
 		p.manifest(w, r, ref)
 		return
 	}
@@ -85,6 +93,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "not found")
 }
+
+// manifestRef is a tag or a digest, which is all a manifest request names.
+var manifestRef = regexp.MustCompile(`^(?:` + reference.TagRegexp.String() + `|` + reference.DigestRegexp.String() + `)$`)
 
 // manifest relays a manifest byte for byte, with the headers dockerd
 // verifies and dispatches on. A registry challenge is not passed on, so
