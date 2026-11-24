@@ -1,8 +1,47 @@
 # justpull
 
-A Go library that pulls container images so that a broken download picks up
-where it stopped instead of starting over: inside one pull, across failed
-attempts, and across restarts of the calling process.
+`docker pull`, except that a broken download picks up where it stopped
+instead of starting over: inside one pull, across failed attempts, and across
+restarts. It is a command, `justpull`, and the Go library behind it.
+
+## The command
+
+```sh
+justpull alpine:3.20
+justpull -q --platform linux/arm64 ghcr.io/example/app@sha256:...
+justpull --all-tags example/app
+```
+
+It takes the same options as `docker pull` (`-a`, `--platform` with
+`DOCKER_DEFAULT_PLATFORM`, `-q`), prints the same output and errors, and
+exits with the same codes. It uses the login `docker login` stored. When a
+registry refuses the login or the image, it says so and how to log in.
+
+**Install.** Download a binary from the releases; it carries the proxy and
+needs nothing else. Or `go install github.com/cryguy/justpull/cmd/justpull@latest`,
+which pulls the proxy image `ghcr.io/cryguy/justpull:<version>` on its first
+run.
+
+**How it works.** Each pull starts the proxy below in a container on the
+host's network, as `nobody`, without capabilities, read-only, with one
+volume, `justpull-cache`, for its files. Docker pulls through it; the image
+then gets the name you asked for. After a successful pull the image's files
+are deleted from the volume. After a failed or interrupted one they stay for
+24 hours, and the next pull of an image sharing those layers continues from
+them. The login reaches the container on its stdin, never in its arguments
+or environment.
+
+**Requirements.** Docker with Linux containers. Docker Desktop on Windows was
+tested; Docker Desktop on macOS was not.
+
+**Remove everything.**
+
+```sh
+docker volume rm justpull-cache
+docker image rm $(docker image ls -q ghcr.io/cryguy/justpull)
+```
+
+## The library
 
 Docker is not replaced. Each pull starts a small read-only registry on
 `127.0.0.1:<random port>` and asks Docker to pull
@@ -15,11 +54,13 @@ while they download, so Docker's own connection never breaks. After a
 successful pull the image is tagged with its real name and the localhost name
 is removed.
 
-Linux only. Pure Go; the library has one dependency,
-`github.com/distribution/reference`, and `cmd/justpull` adds
-`golang.org/x/crypto/x509roots/fallback`.
+The library's cache needs Unix (see Shared cache below); the command runs on
+Windows, macOS and Linux, since its proxy runs in a Linux container. Pure Go;
+the library has one dependency, `github.com/distribution/reference`, and
+`cmd/justpull` adds `golang.org/x/crypto/x509roots/fallback`, `golang.org/x/term`
+and `golang.org/x/sys`.
 
-## Use
+### Use
 
 ```go
 cache, err := justpull.New("/var/lib/example/pullcache", justpull.Options{})
@@ -77,7 +118,7 @@ success.
 
 `cmd/justpull serve` runs a session over stdin and stdout for the justpull CLI.
 
-## Behaviour
+### Behaviour
 
 - **Resume.** Each layer is written to `<dir>/blobs/sha256/<hex>.partial` as it
   arrives and renamed to `<hex>` once its sha256 matches. A broken or quiet
