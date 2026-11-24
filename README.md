@@ -28,7 +28,7 @@ Your `docker login` just works.
   The first run pulls the proxy image `ghcr.io/cryguy/justpull`.
 
 You need Docker with Linux containers. It's been tested on Docker Desktop for
-Windows; macOS hasn't been tried yet.
+Windows and on Colima on macOS.
 
 ## ⚙️ How it works
 
@@ -94,9 +94,12 @@ func (d dockerAdapter) Untag(ctx context.Context, ref string) error {
 
 Logins, progress, sharing one cache between processes, and making the Docker
 calls yourself are all in the
-[package docs](https://pkg.go.dev/github.com/cryguy/justpull). The library
-runs on Linux, macOS and the BSDs, and has one dependency,
-`github.com/distribution/reference`.
+[package docs](https://pkg.go.dev/github.com/cryguy/justpull). It has one
+dependency, `github.com/distribution/reference`.
+
+⚠️ The library needs a Docker that can reach the machine's own `127.0.0.1`,
+like stock Docker on Linux. Docker Desktop and Colima run Docker inside a VM,
+which can't, so on those use the `justpull` command instead.
 
 ## 🛠️ Hacking on it
 
