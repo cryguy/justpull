@@ -482,14 +482,12 @@ func TestServeRefusesABadRequest(t *testing.T) {
 	}
 }
 
-func TestOtherCommandsPrintTheUsage(t *testing.T) {
-	for _, args := range [][]string{nil, {"pull", "alpine"}, {"serve", "extra"}} {
-		var stdout, stderr bytes.Buffer
-		if code := run(args, strings.NewReader(""), &stdout, &stderr); code != 2 {
-			t.Errorf("%q: exit code %d, want 2", args, code)
-		}
-		if !strings.HasPrefix(stderr.String(), "usage: justpull serve") || stdout.Len() != 0 {
-			t.Errorf("%q: stdout %q, stderr %q; want the usage on stderr", args, stdout.String(), stderr.String())
-		}
+func TestServeWithArgumentsPrintsItsUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"serve", "extra"}, strings.NewReader(""), &stdout, &stderr); code != 2 {
+		t.Errorf("exit code %d, want 2", code)
+	}
+	if !strings.HasPrefix(stderr.String(), "usage: justpull serve") || stdout.Len() != 0 {
+		t.Errorf("stdout %q, stderr %q; want the usage on stderr", stdout.String(), stderr.String())
 	}
 }

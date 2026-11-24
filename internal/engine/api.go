@@ -60,10 +60,19 @@ func (c *Client) Pull(ctx context.Context, image, tag, platform string, allTags 
 	}
 	if resp.StatusCode/100 != 2 {
 		defer func() { _ = resp.Body.Close() }()
-		return nil, fmt.Errorf("docker pull %s: %s", image, apiMessage(resp))
+		return nil, &APIError{Call: "docker pull " + image, Message: apiMessage(resp)}
 	}
 	return resp.Body, nil
 }
+
+// APIError is the daemon's error answer to an API call. The docker CLI
+// prints it as "Error response from daemon: " and Message.
+type APIError struct {
+	Call    string
+	Message string
+}
+
+func (e *APIError) Error() string { return e.Call + ": " + e.Message }
 
 // apiMessage is the message of the daemon's error answer {"message":...}.
 func apiMessage(resp *http.Response) string {

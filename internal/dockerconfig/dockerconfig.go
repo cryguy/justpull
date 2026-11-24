@@ -201,7 +201,7 @@ func platformStore() string {
 // references name it (docker.io, ghcr.io, localhost:5000). No login is a zero
 // Credential and a nil error.
 func (c *Config) Credential(ctx context.Context, registry string) (justpull.Credential, error) {
-	addr := serverAddress(registry)
+	addr := ServerAddress(registry)
 	if cred, ok := c.env[addr]; ok {
 		return cred, nil
 	}
@@ -215,10 +215,10 @@ func (c *Config) Credential(ctx context.Context, registry string) (justpull.Cred
 	return c.fromAuths(addr, registry)
 }
 
-// serverAddress is the key the docker CLI files registry's login under.
-// registry-1.docker.io is not Docker Hub here: the CLI keys it by its own
-// name.
-func serverAddress(registry string) string {
+// ServerAddress is the key the docker CLI files registry's login under, and
+// the server address it sends the daemon with that login. registry-1.docker.io
+// is not Docker Hub here: the CLI keys it by its own name.
+func ServerAddress(registry string) string {
 	if registry == "docker.io" || registry == "index.docker.io" {
 		return hubKey
 	}

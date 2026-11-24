@@ -89,7 +89,8 @@ func (f *Docker) Pull(ctx context.Context, ref string) (io.ReadCloser, error) {
 	go func() {
 		enc := json.NewEncoder(pw)
 		if err := f.pull(ctx, ref, enc); err != nil {
-			_ = enc.Encode(map[string]string{"error": err.Error()})
+			// dockerd's failure message: the docker CLI reads errorDetail.
+			_ = enc.Encode(map[string]any{"errorDetail": map[string]string{"message": err.Error()}, "error": err.Error()})
 		}
 		_ = pw.Close()
 	}()
