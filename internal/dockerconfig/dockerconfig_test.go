@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -263,12 +264,18 @@ func TestHelperFailureNeverQuotesTheSecret(t *testing.T) {
 	}
 }
 
-func TestMissingHelperIsAnError(t *testing.T) {
+func TestMissingHelperIsDockersError(t *testing.T) {
 	helperDir(t, true)
 	writeConfig(t, `{"credHelpers":{"ghcr.io":"absent"}}`)
+	_, lookErr := exec.LookPath("docker-credential-absent")
+	if lookErr == nil {
+		t.Fatal("docker-credential-absent is on PATH")
+	}
 	_, err := credential(t, "ghcr.io")
-	if err == nil || !strings.Contains(err.Error(), "docker-credential-absent") || !strings.Contains(err.Error(), "ghcr.io") {
-		t.Fatalf("got %v, want an error naming the helper and the registry", err)
+	// The words docker pull prints for a helper it cannot find.
+	want := "error getting credentials - err: " + lookErr.Error() + ", out: ``"
+	if err == nil || err.Error() != want {
+		t.Fatalf("got %v\nwant %s", err, want)
 	}
 }
 

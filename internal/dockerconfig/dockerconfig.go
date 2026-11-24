@@ -321,7 +321,9 @@ func isPort(s string) bool {
 func runHelper(ctx context.Context, name, addr, registry string) (justpull.Credential, error) {
 	path, err := exec.LookPath(name)
 	if err != nil {
-		return justpull.Credential{}, fmt.Errorf("credential helper %s for %s: %w", name, registry, err)
+		// docker pull's words for a helper it cannot find; nothing ran, so
+		// there is no output to quote.
+		return justpull.Credential{}, fmt.Errorf("error getting credentials - err: %w, out: ``", err)
 	}
 	var stdout bytes.Buffer
 	cmd := exec.CommandContext(ctx, path, "get")
