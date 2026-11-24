@@ -126,7 +126,7 @@ func (f *fakeDocker) pull(ctx context.Context, ref string, enc *json.Encoder) er
 		return err
 	}
 	var m struct {
-		Config struct{ Digest string } `json:"config"`
+		Config struct{ Digest string }   `json:"config"`
 		Layers []struct{ Digest string } `json:"layers"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {

@@ -34,9 +34,9 @@ type proxy struct {
 
 func newProxy(ctx context.Context, c *Cache, t target, cancel context.CancelCauseFunc) *proxy {
 	return &proxy{
-		ctx:     ctx,
-		c:       c,
-		t:       t,
+		ctx:       ctx,
+		c:         c,
+		t:         t,
 		fail:      func(err error) { cancel(err) },
 		sizes:     map[string]int64{},
 		touched:   map[string]bool{},
