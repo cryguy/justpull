@@ -269,8 +269,13 @@ func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 		r.serveTags(w, req, repo)
 		return
 	}
-	if i := strings.LastIndex(rest, "/manifests/"); i > 0 {
-		repo, ref := rest[:i], rest[i+len("/manifests/"):]
+	// A reference has no slash, so the route is the last two segments even
+	// when the repository has a segment named manifests or blobs.
+	head, ref := rest, ""
+	if i := strings.LastIndex(rest, "/"); i >= 0 {
+		head, ref = rest[:i], rest[i+1:]
+	}
+	if repo, ok := strings.CutSuffix(head, "/manifests"); ok {
 		sep := ":"
 		if strings.HasPrefix(ref, "sha256:") {
 			sep = "@"
@@ -290,9 +295,9 @@ func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
-	if i := strings.LastIndex(rest, "/blobs/"); i > 0 {
+	if strings.HasSuffix(head, "/blobs") {
 		r.mu.Lock()
-		b := r.blobs[rest[i+len("/blobs/"):]]
+		b := r.blobs[ref]
 		r.mu.Unlock()
 		if b == nil {
 			http.Error(w, `{"errors":[{"code":"BLOB_UNKNOWN"}]}`, http.StatusNotFound)

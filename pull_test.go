@@ -556,6 +556,7 @@ func TestProxyServesOnlyItsRepository(t *testing.T) {
 		"/v2/other/app/blobs/sha256:x": 404,
 		"/v2/other/app/tags/list":      404,
 		"/v2/team/app/blobs/sha512:ab": 404,
+		"/v2/team/app/nope":            404,
 		"/nope":                        404,
 	} {
 		resp, err := http.Get(srv.URL + path)
@@ -574,6 +575,21 @@ func TestProxyServesOnlyItsRepository(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("POST = %d, want 405", resp.StatusCode)
+	}
+}
+
+func TestPullRepositoryWithARouteSegment(t *testing.T) {
+	for _, repo := range []string{"team/manifests/app", "team/blobs/app", "manifests/blobs"} {
+		reg := fakereg.New(t)
+		reg.AddImage(repo, "v1", 300_000, 200_000)
+		c := newPullCache(t, 5*time.Second)
+		d := fakedocker.New()
+		if err := c.Pull(context.Background(), d, reg.Host+"/"+repo+":v1", nil); err != nil {
+			t.Fatalf("%s: %v", repo, err)
+		}
+		if len(d.Tags) != 1 || d.Tags[0][1] != reg.Host+"/"+repo+":v1" {
+			t.Fatalf("%s: tags = %v", repo, d.Tags)
+		}
 	}
 }
 

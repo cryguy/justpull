@@ -64,28 +64,23 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "not found")
 		return
 	}
-	if repo, ok := strings.CutSuffix(rest, "/tags/list"); ok {
-		if repo != p.t.path {
-			writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "repository not served here")
-			return
-		}
+	// A repository path may itself have a segment named manifests or blobs,
+	// so the route is what follows the served repository.
+	route, ok := strings.CutPrefix(rest, p.t.path+"/")
+	if !ok {
+		writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "repository not served here")
+		return
+	}
+	if route == "tags/list" {
 		p.tags(w, r)
 		return
 	}
-	if i := strings.LastIndex(rest, "/manifests/"); i > 0 {
-		if rest[:i] != p.t.path {
-			writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "repository not served here")
-			return
-		}
-		p.manifest(w, r, rest[i+len("/manifests/"):])
+	if ref, ok := strings.CutPrefix(route, "manifests/"); ok {
+		p.manifest(w, r, ref)
 		return
 	}
-	if i := strings.LastIndex(rest, "/blobs/"); i > 0 {
-		if rest[:i] != p.t.path {
-			writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "repository not served here")
-			return
-		}
-		p.blob(w, r, rest[i+len("/blobs/"):])
+	if digest, ok := strings.CutPrefix(route, "blobs/"); ok {
+		p.blob(w, r, digest)
 		return
 	}
 	writeError(w, http.StatusNotFound, "NAME_UNKNOWN", "not found")
