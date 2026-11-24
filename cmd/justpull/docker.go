@@ -24,7 +24,8 @@ type dockerAPI interface {
 	Tag(ctx context.Context, source, target string) error
 	Untag(ctx context.Context, ref string) error
 	ListTags(ctx context.Context, repo string) ([]string, error)
-	ImageInfo(ctx context.Context, ref string) (engine.Image, bool, error)
+	ImageID(ctx context.Context, ref string) (string, bool, error)
+	TagIDs(ctx context.Context, repo string) (map[string]string, error)
 }
 
 // proxyProc is a running justpull serve.

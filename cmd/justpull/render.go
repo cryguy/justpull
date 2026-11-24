@@ -20,15 +20,14 @@ type renderer struct {
 	width  int
 	rename func(string) string
 	now    func() time.Time
-	// upToDate, if set, reports whether the user's name ref (as the status
-	// line names it, renamed) already pointed to the image with digest
-	// before the pull. Set it before render.
-	upToDate func(ref, digest string) bool
+	// upToDate, if set, reports whether docker pull would find the user's
+	// name ref (as the status line names it, renamed) up to date. It may
+	// call Docker. Set it before render.
+	upToDate func(ref string) bool
 
-	mu     sync.Mutex
-	lines  map[string]int // a layer's line, counted from the first since the last line without progress
-	ended  bool
-	digest string // the stream's last "Digest: " line
+	mu    sync.Mutex
+	lines map[string]int // a layer's line, counted from the first since the last line without progress
+	ended bool
 }
 
 // message is one message of Docker's JSON stream, as the docker CLI reads
@@ -91,8 +90,8 @@ func (r *renderer) render(stream io.Reader) error {
 			return fmt.Errorf("read docker pull stream: %w", err)
 		}
 		m.Status, m.Stream = r.rename(m.Status), r.rename(m.Stream)
-		r.mu.Lock()
 		r.status(&m)
+		r.mu.Lock()
 		err := r.show(m)
 		r.mu.Unlock()
 		if err != nil {
@@ -116,25 +115,18 @@ func (r *renderer) resumed(id string, offset int64) {
 }
 
 const (
-	digestStatus   = "Digest: "
 	newerStatus    = "Status: Downloaded newer image for "
 	upToDateStatus = "Status: Image is up to date for "
 )
 
 // status turns dockerd's "Downloaded newer image" into "Image is up to date"
-// when upToDate says the user's name already pointed to the image of the
-// stream's last Digest line. dockerd compares the pulled name's image before
-// and after, but it pulled the local name, which is always new to it. The
-// caller holds mu.
+// when upToDate says so. dockerd compares the pulled name's image before and
+// after the pull, but it pulled the local name, which is always new to it.
 func (r *renderer) status(m *message) {
 	if r.upToDate == nil || m.ID != "" {
 		return
 	}
-	if d, ok := strings.CutPrefix(m.Status, digestStatus); ok {
-		r.digest = d
-		return
-	}
-	if ref, ok := strings.CutPrefix(m.Status, newerStatus); ok && r.digest != "" && r.upToDate(ref, r.digest) {
+	if ref, ok := strings.CutPrefix(m.Status, newerStatus); ok && r.upToDate(ref) {
 		m.Status = upToDateStatus + ref
 	}
 }

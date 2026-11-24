@@ -26,8 +26,10 @@ type fakeDocker struct {
 	d   *fakedocker.Docker
 	// tags is ListTags' answer, as tags of the repository asked for.
 	tags []string
-	// images is ImageInfo's answer, by the reference asked for.
-	images map[string]engine.Image
+	// ids are the image IDs of the user's names before the pull, by
+	// reference; pulled are those Docker gives the proxy's local names, by
+	// tag or digest.
+	ids, pulled map[string]string
 	// pullErr, if set, may fail a pull as the daemon's API does.
 	pullErr func(image string) error
 	// failStart makes the container end at once with this on stderr.
@@ -141,9 +143,43 @@ func (f *fakeDocker) ListTags(_ context.Context, repo string) ([]string, error) 
 	return refs, nil
 }
 
-func (f *fakeDocker) ImageInfo(_ context.Context, ref string) (engine.Image, bool, error) {
-	img, ok := f.images[ref]
-	return img, ok, nil
+// local reports whether repo is the proxy's local repository: the first
+// pull's.
+func (f *fakeDocker) local(repo string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pulls) > 0 && f.pulls[0].image == repo
+}
+
+func (f *fakeDocker) ImageID(_ context.Context, ref string) (string, bool, error) {
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return "", false, err
+	}
+	if f.local(named.Name()) {
+		id, ok := f.pulled[tagOrDigest(named)]
+		return id, ok, nil
+	}
+	id, ok := f.ids[ref]
+	return id, ok, nil
+}
+
+func (f *fakeDocker) TagIDs(_ context.Context, repo string) (map[string]string, error) {
+	ids := map[string]string{}
+	if f.local(repo) {
+		for tag, id := range f.pulled {
+			if !strings.HasPrefix(tag, "sha256:") {
+				ids[tag] = id
+			}
+		}
+		return ids, nil
+	}
+	for ref, id := range f.ids {
+		if tag, ok := strings.CutPrefix(ref, repo+":"); ok {
+			ids[tag] = id
+		}
+	}
+	return ids, nil
 }
 
 // proxyRepo is the local repository of the first pull: the proxy's.
@@ -301,7 +337,8 @@ func TestPullAllTagsRetagsEveryTag(t *testing.T) {
 	f := newFake(t)
 	f.tags = []string{"v1", "v2"}
 	name := reg.Host + "/team/app"
-	f.images = map[string]engine.Image{name + ":v1": {RepoDigests: []string{name + "@" + v1.Digest}}}
+	f.ids = map[string]string{name + ":v1": v1.Digest}
+	f.pulled = map[string]string{"v1": v1.Digest, "v2": v2.Digest}
 
 	res := runPull(t, context.Background(), f, nil, nil, "-a", name)
 	if res.code != 0 || strings.Contains(res.stdout, "Using default tag") ||
@@ -325,23 +362,31 @@ func TestPullSaysUpToDateAsDocker(t *testing.T) {
 	img := reg.AddImage("team/app", "v1", 100_000)
 	name := reg.Host + "/team/app"
 	other := "sha256:" + strings.Repeat("0", 64)
+	upToDate, newer := "Status: Image is up to date for ", "Status: Downloaded newer image for "
+	// The containerd store's image ID is the manifest's digest, the
+	// graphdriver store's the config's. The stream's Digest line is the
+	// manifest's either way.
 	tests := []struct {
-		name   string
-		ref    string
-		images map[string]engine.Image
-		want   string
+		name        string
+		ref         string
+		ids, pulled map[string]string
+		want        string
 	}{
-		{"present at the same digest", name + ":v1", map[string]engine.Image{name + ":v1": {ID: "sha256:abc", RepoDigests: []string{name + "@" + other, name + "@" + img.Digest}}}, "Status: Image is up to date for " + name + ":v1"},
-		{"present at another digest", name + ":v1", map[string]engine.Image{name + ":v1": {ID: "sha256:abc", RepoDigests: []string{name + "@" + other}}}, "Status: Downloaded newer image for " + name + ":v1"},
-		{"the digest only under another repository", name + ":v1", map[string]engine.Image{name + ":v1": {ID: "sha256:abc", RepoDigests: []string{"team/app@" + img.Digest}}}, "Status: Downloaded newer image for " + name + ":v1"},
-		{"absent", name + ":v1", nil, "Status: Downloaded newer image for " + name + ":v1"},
-		{"a digest reference present", name + "@" + img.Digest, map[string]engine.Image{name + "@" + img.Digest: {ID: "sha256:abc", RepoDigests: []string{name + "@" + img.Digest}}}, "Status: Image is up to date for " + name + "@" + img.Digest},
-		{"a digest reference absent", name + "@" + img.Digest, nil, "Status: Downloaded newer image for " + name + "@" + img.Digest},
+		{"containerd: the same image", name + ":v1", map[string]string{name + ":v1": img.Digest}, map[string]string{"v1": img.Digest}, upToDate + name + ":v1"},
+		{"containerd: another image", name + ":v1", map[string]string{name + ":v1": other}, map[string]string{"v1": img.Digest}, newer + name + ":v1"},
+		// The name never held the manifest's digest: the index moved on with
+		// this platform's config unchanged, or docker load gave the image.
+		{"graphdriver: the same config under a manifest new to the name", name + ":v1", map[string]string{name + ":v1": img.Config.Digest}, map[string]string{"v1": img.Config.Digest}, upToDate + name + ":v1"},
+		// As when the same index is pulled for another platform.
+		{"graphdriver: another config", name + ":v1", map[string]string{name + ":v1": other}, map[string]string{"v1": img.Config.Digest}, newer + name + ":v1"},
+		{"absent", name + ":v1", nil, map[string]string{"v1": img.Digest}, newer + name + ":v1"},
+		{"a digest reference present", name + "@" + img.Digest, map[string]string{name + "@" + img.Digest: img.Digest}, map[string]string{img.Digest: img.Digest}, upToDate + name + "@" + img.Digest},
+		{"a digest reference absent", name + "@" + img.Digest, nil, map[string]string{img.Digest: img.Digest}, newer + name + "@" + img.Digest},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFake(t)
-			f.images = tt.images
+			f.ids, f.pulled = tt.ids, tt.pulled
 			res := runPull(t, context.Background(), f, nil, nil, tt.ref)
 			if want := "\nDigest: " + img.Digest + "\n" + tt.want + "\n" + tt.ref + "\n"; res.code != 0 || !strings.HasSuffix(res.stdout, want) {
 				t.Fatalf("exit code %d, stdout %q, stderr %q; want the end %q", res.code, res.stdout, res.stderr, want)
@@ -352,16 +397,49 @@ func TestPullSaysUpToDateAsDocker(t *testing.T) {
 
 func TestUpToDateReadsDockersNames(t *testing.T) {
 	digest := "sha256:" + strings.Repeat("a", 64)
-	for _, tt := range []struct{ user, inspected, status string }{
-		{"alpine:3.20", "docker.io/library/alpine:3.20", "alpine:3.20"},
-		{"alpine:3.20@" + digest, "docker.io/library/alpine@" + digest, "alpine@" + digest},
+	local, _ := reference.ParseNormalizedNamed("127.0.0.1:41234/library/alpine")
+	for _, tt := range []struct{ user, inspected, status, pulled string }{
+		{"alpine:3.20", "docker.io/library/alpine:3.20", "alpine:3.20", "3.20"},
+		{"alpine:3.20@" + digest, "docker.io/library/alpine@" + digest, "alpine@" + digest, digest},
 	} {
 		named, _ := reference.ParseNormalizedNamed(tt.user)
 		f := newFake(t)
-		f.images = map[string]engine.Image{tt.inspected: {ID: "sha256:abc", RepoDigests: []string{"alpine@" + digest}}}
-		held, err := (&puller{named: named}).held(context.Background(), f)
-		if err != nil || !upToDate(held)(tt.status, digest) {
-			t.Errorf("%s: held %v, %v; want %s up to date", tt.user, held, err, tt.status)
+		f.ids = map[string]string{tt.inspected: "sha256:abc"}
+		f.pulled = map[string]string{tt.pulled: "sha256:abc"}
+		p := &puller{named: named}
+		before, err := p.before(context.Background(), f)
+		f.pulls = []pullCall{{image: local.Name()}} // the status line comes from the local name's pull
+		if err != nil || !p.upToDate(context.Background(), f, local, before)(tt.status) {
+			t.Errorf("%s: before %v, %v; want %s up to date", tt.user, before, err, tt.status)
+		}
+	}
+}
+
+// The graphdriver store ends a pull of every tag with one status for the
+// repository alone; docker says up to date when no tag got another image.
+func TestUpToDateAllTagsOnGraphdriver(t *testing.T) {
+	named, _ := reference.ParseNormalizedNamed("alpine")
+	local, _ := reference.ParseNormalizedNamed("127.0.0.1:41234/library/alpine")
+	p := &puller{named: named, opts: pullOptions{all: true}}
+	f := newFake(t)
+	f.ids = map[string]string{"alpine:3.19": "sha256:a", "alpine:3.20": "sha256:b"}
+	before, err := p.before(context.Background(), f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.pulls = []pullCall{{image: local.Name(), allTags: true}}
+	for _, tt := range []struct {
+		name   string
+		pulled map[string]string
+		want   bool
+	}{
+		{"every tag unchanged", map[string]string{"3.19": "sha256:a", "3.20": "sha256:b"}, true},
+		{"a tag changed", map[string]string{"3.19": "sha256:a", "3.20": "sha256:c"}, false},
+		{"a tag new", map[string]string{"3.19": "sha256:a", "3.20": "sha256:b", "3.21": "sha256:d"}, false},
+	} {
+		f.pulled = tt.pulled
+		if got := p.upToDate(context.Background(), f, local, before)("alpine"); got != tt.want {
+			t.Errorf("%s: up to date %v, want %v", tt.name, got, tt.want)
 		}
 	}
 }

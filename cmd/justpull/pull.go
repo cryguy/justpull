@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -103,9 +102,9 @@ func (p *puller) run(ctx context.Context) int {
 	if err != nil {
 		return p.failed(ctx, err)
 	}
-	var held map[string][]string
+	var before map[string]string
 	if !p.opts.quiet {
-		if held, err = p.held(ctx, d); err != nil {
+		if before, err = p.before(ctx, d); err != nil {
 			return p.failed(ctx, err)
 		}
 	}
@@ -122,60 +121,82 @@ func (p *puller) run(ctx context.Context) int {
 		return p.failed(ctx, err)
 	}
 	s := newSession(proc)
-	return p.session(ctx, d, s, cred, held)
+	return p.session(ctx, d, s, cred, before)
 }
 
-// held records what the user's names point to before the pull: for each name,
-// by heldKey, the digests of the user's repository its image holds. A name
-// Docker does not have is left out. With all tags the names are the
-// repository's tags Docker has.
-func (p *puller) held(ctx context.Context, d dockerAPI) (map[string][]string, error) {
-	refs := []string{heldKey(p.named)}
+// before records the image IDs of the user's names before the pull, by
+// nameOf the name. A name Docker does not have is left out. With all tags the
+// names are the repository's tags Docker has.
+func (p *puller) before(ctx context.Context, d dockerAPI) (map[string]string, error) {
+	ids := map[string]string{}
 	if p.opts.all {
-		var err error
-		if refs, err = d.ListTags(ctx, reference.FamiliarName(p.named)); err != nil {
-			return nil, err
-		}
-	}
-	held := map[string][]string{}
-	for _, ref := range refs {
-		img, ok, err := d.ImageInfo(ctx, ref)
+		tags, err := d.TagIDs(ctx, reference.FamiliarName(p.named))
 		if err != nil {
 			return nil, err
 		}
-		named, perr := reference.ParseNormalizedNamed(ref)
-		if !ok || perr != nil {
-			continue
+		for tag, id := range tags {
+			ids[p.named.Name()+":"+tag] = id
 		}
-		key := heldKey(named)
-		for _, rd := range img.RepoDigests {
-			c, err := reference.ParseNormalizedNamed(rd)
-			if err != nil || c.Name() != p.named.Name() {
-				continue
-			}
-			if dg, ok := c.(reference.Digested); ok {
-				held[key] = append(held[key], dg.Digest().String())
-			}
-		}
+		return ids, nil
 	}
-	return held, nil
+	key := nameOf(p.named.Name(), p.named)
+	id, ok, err := d.ImageID(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
+		ids[key] = id
+	}
+	return ids, nil
 }
 
-// heldKey is how a status line names ref: by its digest alone when it has
-// one, as the proxy's local name drops the tag of a tag and digest.
-func heldKey(ref reference.Named) string {
+// nameOf is ref's tag or digest under the repository name: by its digest
+// alone when it has one, as the proxy's local name drops the tag of a tag and
+// digest; name alone when ref has neither.
+func nameOf(name string, ref reference.Named) string {
 	if d, ok := ref.(reference.Digested); ok {
-		return reference.TrimNamed(ref).String() + "@" + d.Digest().String()
+		return name + "@" + d.Digest().String()
 	}
-	return ref.String()
+	if t, ok := ref.(reference.Tagged); ok {
+		return name + ":" + t.Tag()
+	}
+	return name
 }
 
-// upToDate is the renderer's upToDate for the names held: dockerd reports a
-// pull up to date when the name's image is the one it pulled.
-func upToDate(held map[string][]string) func(ref, digest string) bool {
-	return func(ref, digest string) bool {
+// upToDate is the renderer's upToDate. dockerd reports a pull up to date when
+// the pulled name's image ID is the one the name had before. That holds on
+// both image stores: the containerd store's ID is the manifest or index
+// digest the name points to, the graphdriver store's the config digest. At
+// the status line Docker has the pulled image under the local name. A status
+// for the repository alone ends the graphdriver store's all-tags pull: it is
+// up to date when every tag pulled has the ID its user's name had.
+func (p *puller) upToDate(ctx context.Context, d dockerAPI, local reference.Named, before map[string]string) func(string) bool {
+	return func(ref string) bool {
 		named, err := reference.ParseNormalizedNamed(ref)
-		return err == nil && slices.Contains(held[heldKey(named)], digest)
+		if err != nil {
+			return false
+		}
+		if reference.IsNameOnly(named) {
+			if len(before) == 0 {
+				return false
+			}
+			after, err := d.TagIDs(ctx, local.Name())
+			if err != nil || len(after) == 0 {
+				return false
+			}
+			for tag, id := range after {
+				if before[named.Name()+":"+tag] != id {
+					return false
+				}
+			}
+			return true
+		}
+		id, ok := before[nameOf(named.Name(), named)]
+		if !ok {
+			return false
+		}
+		now, ok, err := d.ImageID(ctx, nameOf(local.Name(), named))
+		return err == nil && ok && now == id
 	}
 }
 
@@ -211,7 +232,7 @@ func (p *puller) failed(ctx context.Context, err error) int {
 	return 1
 }
 
-func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred justpull.Credential, held map[string][]string) int {
+func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred justpull.Credential, before map[string]string) int {
 	req := request{Ref: p.named.String(), AllTags: p.opts.all}
 	req.Credential.Username = cred.Username
 	req.Credential.Password = cred.Password
@@ -259,9 +280,11 @@ func (p *puller) session(ctx context.Context, d dockerAPI, s *session, cred just
 	}
 	rename := renamer(local, p.named)
 	r := newRenderer(p.e.stdout, p.e.tty, p.e.width, p.opts.quiet, rename)
-	r.upToDate = upToDate(held)
 	pullCtx, cancelPull := context.WithCancel(ctx)
 	defer cancelPull()
+	if !p.opts.quiet {
+		r.upToDate = p.upToDate(pullCtx, d, local, before)
+	}
 	s.dispatch(r, cancelPull)
 
 	if err := p.pull(pullCtx, d, local, r); err != nil {

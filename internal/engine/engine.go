@@ -50,40 +50,38 @@ func (c *Client) Untag(ctx context.Context, ref string) error {
 
 // ImageExists reports whether Docker has an image named ref.
 func (c *Client) ImageExists(ctx context.Context, ref string) (bool, error) {
-	_, err := c.run(ctx, nil, "image", "inspect", "--format", "{{.Id}}", ref)
+	_, ok, err := c.ImageID(ctx, ref)
+	return ok, err
+}
+
+// ImageID returns the ID of the image Docker has under ref; ok is false when
+// it has none.
+func (c *Client) ImageID(ctx context.Context, ref string) (id string, ok bool, err error) {
+	out, err := c.run(ctx, nil, "image", "inspect", "--format", "{{.Id}}", ref)
 	if err == nil {
-		return true, nil
+		return strings.TrimSpace(out), true, nil
 	}
-	if noSuchImage(err) {
-		return false, nil
+	if re, isRun := errors.AsType[*runError](err); isRun && strings.Contains(re.stderr, "No such image") {
+		return "", false, nil
 	}
-	return false, err
+	return "", false, err
 }
 
-// Image is what docker image inspect reports of an image.
-type Image struct {
-	ID string
-	// RepoDigests are its names by digest, such as alpine@sha256:...
-	RepoDigests []string
-}
-
-// ImageInfo returns the image Docker has under ref; ok is false when it has
-// none.
-func (c *Client) ImageInfo(ctx context.Context, ref string) (img Image, ok bool, err error) {
-	out, err := c.run(ctx, nil, "image", "inspect", "--format", "{{.Id}}{{range .RepoDigests}}\t{{.}}{{end}}", ref)
+// TagIDs returns the image ID of each tag Docker has in repo, by tag.
+func (c *Client) TagIDs(ctx context.Context, repo string) (map[string]string, error) {
+	out, err := c.run(ctx, nil, "image", "ls", "--no-trunc", "--format", "{{.Tag}}\t{{.ID}}", repo)
 	if err != nil {
-		if noSuchImage(err) {
-			return Image{}, false, nil
-		}
-		return Image{}, false, err
+		return nil, err
 	}
-	fields := strings.Split(strings.TrimSpace(out), "\t")
-	return Image{ID: fields[0], RepoDigests: fields[1:]}, true, nil
-}
-
-func noSuchImage(err error) bool {
-	re, ok := errors.AsType[*runError](err)
-	return ok && strings.Contains(re.stderr, "No such image")
+	ids := map[string]string{}
+	for line := range strings.Lines(out) {
+		tag, id, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if !ok || tag == "<none>" {
+			continue
+		}
+		ids[tag] = id
+	}
+	return ids, nil
 }
 
 // ListTags returns the names docker images lists for repo, as repo:tag.

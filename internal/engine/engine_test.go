@@ -376,33 +376,32 @@ func TestImageExists(t *testing.T) {
 	}
 }
 
-func TestImageInfo(t *testing.T) {
-	tests := []struct {
-		name    string
-		f       fake
-		want    Image
-		wantOK  bool
-		wantErr string
-	}{
-		{"with repo digests", fake{Stdout: "sha256:abc\talpine@sha256:d1\tmy/alpine@sha256:d2\n"}, Image{ID: "sha256:abc", RepoDigests: []string{"alpine@sha256:d1", "my/alpine@sha256:d2"}}, true, ""},
-		{"without", fake{Stdout: "sha256:abc\n"}, Image{ID: "sha256:abc", RepoDigests: []string{}}, true, ""},
-		{"absent", fake{Stderr: "Error response from daemon: No such image: x:v1\n", Exit: 1}, Image{}, false, ""},
-		{"daemon down", fake{Stderr: "Cannot connect to the Docker daemon\n", Exit: 1}, Image{}, false, "docker image inspect --format {{.Id}}{{range .RepoDigests}}\t{{.}}{{end}} x:v1: Cannot connect to the Docker daemon"},
+func TestImageID(t *testing.T) {
+	c, last := newFake(t, fake{Stdout: "sha256:abc\n"})
+	if id, ok, err := c.ImageID(t.Context(), "x:v1"); id != "sha256:abc" || !ok || err != nil {
+		t.Errorf("ImageID = %q, %v, %v; want sha256:abc", id, ok, err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c, last := newFake(t, tt.f)
-			got, ok, err := c.ImageInfo(t.Context(), "x:v1")
-			if !reflect.DeepEqual(got, tt.want) || ok != tt.wantOK {
-				t.Errorf("ImageInfo = %+v, %v; want %+v, %v", got, ok, tt.want, tt.wantOK)
-			}
-			if tt.wantErr == "" && err != nil || tt.wantErr != "" && (err == nil || err.Error() != tt.wantErr) {
-				t.Errorf("err = %v, want %q", err, tt.wantErr)
-			}
-			if args := last().Args; !reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{.Id}}{{range .RepoDigests}}\t{{.}}{{end}}", "x:v1"}) {
-				t.Errorf("args = %q", args)
-			}
-		})
+	if args := last().Args; !reflect.DeepEqual(args, []string{"image", "inspect", "--format", "{{.Id}}", "x:v1"}) {
+		t.Errorf("args = %q", args)
+	}
+	c, _ = newFake(t, fake{Stderr: "Error response from daemon: No such image: x:v1\n", Exit: 1})
+	if id, ok, err := c.ImageID(t.Context(), "x:v1"); id != "" || ok || err != nil {
+		t.Errorf("ImageID of a missing image = %q, %v, %v; want not ok", id, ok, err)
+	}
+}
+
+func TestTagIDs(t *testing.T) {
+	const repo = "127.0.0.1:41234/library/alpine"
+	c, last := newFake(t, fake{Stdout: "3.20\tsha256:aa\n<none>\tsha256:bb\n3.19\tsha256:cc\n"})
+	got, err := c.TagIDs(t.Context(), repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"3.20": "sha256:aa", "3.19": "sha256:cc"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("TagIDs = %q, want %q", got, want)
+	}
+	if args := last().Args; !reflect.DeepEqual(args, []string{"image", "ls", "--no-trunc", "--format", "{{.Tag}}\t{{.ID}}", repo}) {
+		t.Errorf("args = %q", args)
 	}
 }
 
