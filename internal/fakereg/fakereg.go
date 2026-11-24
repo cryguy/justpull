@@ -1,7 +1,8 @@
 // Package fakereg is an in-process OCI registry for tests: images with
 // random layers, a paged tag list, optional bearer auth, an optional login
 // (basic, or for the token), optional redirects to a separate storage host
-// whose links expire, and scripted faults on blob GETs.
+// whose links expire, scripted faults on blob GETs, and an optional rate
+// limit on blob bodies.
 package fakereg
 
 import (
@@ -81,6 +82,9 @@ type Request struct {
 	Range  string
 	Auth   string
 	Status int
+	// Bytes is the body bytes sent; a Reset's response, written by hand,
+	// counts none.
+	Bytes int64
 }
 
 // Registry is the fake. Configure it before the first request.
@@ -107,6 +111,9 @@ type Registry struct {
 	// AbsoluteLinks makes the tag list's Link to the next page a full URL,
 	// as some registries send, instead of a path.
 	AbsoluteLinks bool
+	// Throttle, when set, sends each blob body at most this many bytes a
+	// second, so a download lasts long enough to watch or to overlap.
+	Throttle int
 
 	t       testing.TB
 	srv     *httptest.Server
@@ -212,7 +219,7 @@ func (r *Registry) record(req Request) {
 func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 	entry := Request{Host: "registry", Method: req.Method, Path: req.URL.Path, Range: req.Header.Get("Range"), Auth: req.Header.Get("Authorization")}
 	sw := &statusWriter{ResponseWriter: w}
-	defer func() { entry.Status = sw.status; r.record(entry) }()
+	defer func() { entry.Status, entry.Bytes = sw.status, sw.bytes; r.record(entry) }()
 	w = sw
 
 	if req.URL.Path == "/token" {
@@ -358,7 +365,7 @@ func (r *Registry) loggedIn(req *http.Request) bool {
 func (r *Registry) serveStorage(w http.ResponseWriter, req *http.Request) {
 	entry := Request{Host: "storage", Method: req.Method, Path: req.URL.Path, Range: req.Header.Get("Range"), Auth: req.Header.Get("Authorization")}
 	sw := &statusWriter{ResponseWriter: w}
-	defer func() { entry.Status = sw.status; r.record(entry) }()
+	defer func() { entry.Status, entry.Bytes = sw.status, sw.bytes; r.record(entry) }()
 	w = sw
 
 	if exp, _ := strconv.ParseInt(req.URL.Query().Get("exp"), 10, 64); exp != 0 && time.Now().UnixNano() > exp {
@@ -454,7 +461,7 @@ func (r *Registry) serveBytes(w http.ResponseWriter, req *http.Request, b *Blob)
 			w.Header()[k] = v
 		}
 		w.WriteHeader(status)
-		_, _ = w.Write(body[:half])
+		r.send(w, req, body[:half])
 		_ = http.NewResponseController(w).Flush()
 		if fault == Cut {
 			panic(http.ErrAbortHandler)
@@ -466,7 +473,36 @@ func (r *Registry) serveBytes(w http.ResponseWriter, req *http.Request, b *Blob)
 		w.Header()[k] = v
 	}
 	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	r.send(w, req, body)
+}
+
+// send writes body, at most Throttle bytes a second when that is set, and
+// stops early when the client leaves.
+func (r *Registry) send(w http.ResponseWriter, req *http.Request, body []byte) {
+	if r.Throttle <= 0 {
+		_, _ = w.Write(body)
+		return
+	}
+	rc := http.NewResponseController(w)
+	chunk := max(r.Throttle/20, 1)
+	start := time.Now()
+	for sent := 0; sent < len(body); {
+		n := min(chunk, len(body)-sent)
+		if _, err := w.Write(body[sent : sent+n]); err != nil {
+			return
+		}
+		_ = rc.Flush()
+		sent += n
+		if sent == len(body) {
+			return
+		}
+		due := start.Add(time.Duration(float64(sent) / float64(r.Throttle) * float64(time.Second)))
+		select {
+		case <-time.After(time.Until(due)):
+		case <-req.Context().Done():
+			return
+		}
+	}
 }
 
 // resetAfter writes the response head and some body by hand, then closes
@@ -491,6 +527,7 @@ func resetAfter(w http.ResponseWriter, status int, header http.Header, body []by
 type statusWriter struct {
 	http.ResponseWriter
 	status int
+	bytes  int64
 }
 
 func (s *statusWriter) WriteHeader(code int) {
@@ -504,7 +541,9 @@ func (s *statusWriter) Write(p []byte) (int, error) {
 	if s.status == 0 {
 		s.status = http.StatusOK
 	}
-	return s.ResponseWriter.Write(p)
+	n, err := s.ResponseWriter.Write(p)
+	s.bytes += int64(n)
+	return n, err
 }
 
 func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
