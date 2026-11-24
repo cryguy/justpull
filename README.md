@@ -15,7 +15,9 @@ while they download, so Docker's own connection never breaks. After a
 successful pull the image is tagged with its real name and the localhost name
 is removed.
 
-Linux only. Pure Go; one dependency, `github.com/distribution/reference`.
+Linux only. Pure Go; the library has one dependency,
+`github.com/distribution/reference`, and `cmd/justpull` adds
+`golang.org/x/crypto/x509roots/fallback`.
 
 ## Use
 
@@ -72,6 +74,8 @@ Docker pulls `s.LocalRef()`. `s.Context()` ends, with the failure as its cause,
 when a layer fails for good; cancel Docker's pull then. Tag the image and end
 with `s.Finish(success)`, which deletes the image's cached files only on
 success.
+
+`cmd/justpull serve` runs a session over stdin and stdout for the justpull CLI.
 
 ## Behaviour
 
@@ -147,7 +151,8 @@ token with a password or a refresh token), storage redirects with expiring
 links, and scripted faults per blob request (cut, reset, stall, corruption,
 ignored `Range`, wrong start offset, `401` without a challenge).
 `internal/fakedocker` pulls through the proxy the way dockerd does, including
-skipping manifests and layers it already holds.
+skipping manifests and layers it already holds and pulling every tag of a
+repository named without one.
 
 ## License
 

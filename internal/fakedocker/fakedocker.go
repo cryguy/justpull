@@ -1,6 +1,7 @@
 // Package fakedocker is a Docker for tests. It pulls like dockerd:
 // manifest, config, then each layer it does not have, resuming a blob with
-// Range when its body ends early. It writes dockerd's progress stream.
+// Range when its body ends early; a repository with no tag is pulled with
+// every tag from its tag list. It writes dockerd's progress stream.
 package fakedocker
 
 import (
@@ -12,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +34,8 @@ type Docker struct {
 	Pulls  []string
 	Tags   [][2]string
 	Untags []string
+	// TagLists records the URL of every tag list page it asked for.
+	TagLists []string
 
 	client    *http.Client
 	mu        sync.Mutex
@@ -121,7 +125,66 @@ func (f *Docker) pull(ctx context.Context, ref string, enc *json.Encoder) error 
 		name, mref = rest[:i], rest[i+1:]
 	}
 	base := "http://" + host + "/v2/" + name
+	if mref != "" {
+		return f.pullImage(ctx, ref, base, name, mref, enc)
+	}
 
+	// A repository with no tag is pulled with every tag, as by
+	// docker pull --all-tags.
+	tags, err := f.tagList(ctx, base+"/tags/list")
+	if err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if err := f.pullImage(ctx, ref+":"+tag, base, name, tag, enc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// tagList reads every page of the tag list as dockerd does: the next page
+// is the Link's URL between < and >, resolved against the page asked for.
+func (f *Docker) tagList(ctx context.Context, rawURL string) ([]string, error) {
+	page, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	var tags []string
+	for {
+		f.mu.Lock()
+		f.TagLists = append(f.TagLists, page.String())
+		f.mu.Unlock()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, page.String(), nil)
+		resp, err := f.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("tag list: %s: %s", resp.Status, raw)
+		}
+		var body struct {
+			Tags []string `json:"tags"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			return nil, err
+		}
+		tags = append(tags, body.Tags...)
+		link := resp.Header.Get("Link")
+		if link == "" {
+			return tags, nil
+		}
+		next, err := url.Parse(strings.Trim(strings.Split(link, ";")[0], "<>"))
+		if err != nil {
+			return nil, err
+		}
+		page = page.ResolveReference(next)
+	}
+}
+
+func (f *Docker) pullImage(ctx context.Context, ref, base, name, mref string, enc *json.Encoder) error {
 	raw, err := f.manifest(ctx, base+"/manifests/"+mref)
 	if err != nil {
 		return err
