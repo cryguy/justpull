@@ -66,7 +66,7 @@ func parseRef(ref string) (target, error) {
 	if domain == "docker.io" {
 		host = "registry-1.docker.io"
 	}
-	t := target{remote: remote{host: host, repo: path}, scheme: schemeFor(host), path: path}
+	t := target{remote: remote{host: host, repo: path, registry: domain}, scheme: schemeFor(host), path: path}
 	if d, ok := named.(reference.Digested); ok {
 		t.digest = d.Digest().String()
 		t.original = reference.TrimNamed(named).String() + "@" + t.digest
@@ -85,13 +85,20 @@ func schemeFor(host string) string {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		name = h
 	}
-	if name == "localhost" {
-		return "http"
-	}
-	if ip := net.ParseIP(name); ip != nil && ip.IsLoopback() {
+	if isLoopback(name) {
 		return "http"
 	}
 	return "https"
+}
+
+// isLoopback reports whether a host name without port is localhost or a
+// loopback address.
+func isLoopback(name string) bool {
+	if name == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(name)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (t target) localRef(addr string) string {

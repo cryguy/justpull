@@ -42,7 +42,8 @@ func newTestRegistry(t *testing.T) *testRegistry {
 }
 
 func (r *testRegistry) remote() remote {
-	return remote{host: strings.TrimPrefix(r.reg.URL, "http://"), repo: "team/app"}
+	host := strings.TrimPrefix(r.reg.URL, "http://")
+	return remote{host: host, repo: "team/app", registry: host}
 }
 
 func (r *testRegistry) serveRegistry(w http.ResponseWriter, req *http.Request) {
@@ -113,7 +114,7 @@ func (r *testRegistry) serveStorage(w http.ResponseWriter, req *http.Request) {
 	http.ServeContent(w, req, "data", time.Time{}, strings.NewReader(storageBody))
 }
 
-func testUpstream() *upstream { return newUpstream() }
+func testUpstream() *upstream { return newUpstream(nil) }
 
 type registryCounts struct {
 	storageAuth, storageRanges []string
@@ -257,15 +258,160 @@ func TestManifestRetries5xxAndForwardsAccept(t *testing.T) {
 	}
 }
 
-func TestParseBearerChallenge(t *testing.T) {
-	ch, ok := parseBearerChallenge(`Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:a/b:pull,push"`)
-	if !ok || ch.realm != "https://auth.docker.io/token" || ch.service != "registry.docker.io" || ch.scope != "repository:a/b:pull,push" {
-		t.Fatalf("%+v %v", ch, ok)
+func TestParseChallenge(t *testing.T) {
+	scheme, p := parseChallenge(`Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:a/b:pull,push"`)
+	if scheme != "bearer" || p["realm"] != "https://auth.docker.io/token" || p["service"] != "registry.docker.io" || p["scope"] != "repository:a/b:pull,push" {
+		t.Fatalf("%q %v", scheme, p)
 	}
-	for _, h := range []string{"", "Basic realm=\"x\"", "Bearer service=\"x\""} {
-		if _, ok := parseBearerChallenge(h); ok {
-			t.Errorf("%q parsed as a usable challenge", h)
+	if scheme, p := parseChallenge(`Basic realm="fakereg"`); scheme != "basic" || p["realm"] != "fakereg" {
+		t.Fatalf("basic = %q %v", scheme, p)
+	}
+	if scheme, p := parseChallenge(""); scheme != "" || len(p) != 0 {
+		t.Fatalf("empty = %q %v", scheme, p)
+	}
+	if _, p := parseChallenge(`Bearer service="x"`); p["realm"] != "" {
+		t.Fatalf("realm %q read from a challenge without one", p["realm"])
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func stubResponse(req *http.Request, status int, header http.Header, body string) *http.Response {
+	if header == nil {
+		header = http.Header{}
+	}
+	return &http.Response{
+		StatusCode: status, Status: fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header: header, Body: io.NopCloser(strings.NewReader(body)), Request: req,
+	}
+}
+
+func TestLoginIsNeverSentOverPlainHTTP(t *testing.T) {
+	bearer := `Bearer realm="http://example.invalid/token",service="test"`
+	password := Credential{Username: "alice", Password: "pw"}
+	cases := []struct {
+		name      string
+		challenge string
+		cred      Credential
+		refused   bool
+	}{
+		{"bearer with password", bearer, password, true},
+		{"bearer with identity token", bearer, Credential{IdentityToken: "rt"}, true},
+		{"basic", `Basic realm="x"`, password, true},
+		{"anonymous bearer", bearer, Credential{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var sent []*http.Request
+			u := newUpstream(func(context.Context, string) (Credential, error) { return tc.cred, nil })
+			stub := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				mu.Lock()
+				sent = append(sent, req)
+				mu.Unlock()
+				if req.URL.Path == "/token" {
+					return stubResponse(req, http.StatusOK, nil, `{"token":"anon"}`), nil
+				}
+				if req.Header.Get("Authorization") == "Bearer anon" {
+					return stubResponse(req, http.StatusOK, nil, "{}"), nil
+				}
+				return stubResponse(req, http.StatusUnauthorized, http.Header{"Www-Authenticate": {tc.challenge}}, ""), nil
+			})
+			u.client.Transport, u.tokenClient.Transport = stub, stub
+			rm := remote{host: "example.invalid", repo: "team/app", registry: "example.invalid"}
+
+			resp, err := u.registryDo(context.Background(), http.MethodGet, rm.url("http", "manifests", "v1"), nil, rm)
+			if !tc.refused {
+				if err != nil {
+					t.Fatal(err)
+				}
+				drain(resp)
+				if resp.StatusCode != http.StatusOK || len(sent) != 3 || sent[1].URL.Path != "/token" {
+					t.Fatalf("status %d after %d requests; want the anonymous token fetched", resp.StatusCode, len(sent))
+				}
+				return
+			}
+			if err == nil {
+				drain(resp)
+				t.Fatalf("status %d, want the login refused", resp.StatusCode)
+			}
+			if !isPermanent(err) || !strings.Contains(err.Error(), "plain HTTP") || !strings.Contains(err.Error(), "example.invalid") {
+				t.Fatalf("err = %v, want a permanent refusal naming the registry", err)
+			}
+			for _, req := range sent {
+				if req.URL.Path == "/token" || req.Header.Get("Authorization") != "" {
+					t.Fatalf("%s %s was sent with the login", req.Method, req.URL.Path)
+				}
+			}
+		})
+	}
+}
+
+func TestIdentityTokenIsExchangedWithAPost(t *testing.T) {
+	var mu sync.Mutex
+	var form map[string]string
+	var method, contentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/token" {
+			mu.Lock()
+			method, contentType = req.Method, req.Header.Get("Content-Type")
+			form = map[string]string{}
+			for _, k := range []string{"grant_type", "refresh_token", "service", "scope", "client_id"} {
+				form[k] = req.PostFormValue(k)
+			}
+			mu.Unlock()
+			if req.PostFormValue("refresh_token") != "rt-good" {
+				http.Error(w, `{"error":"invalid_grant"}`, http.StatusBadRequest)
+				return
+			}
+			_, _ = io.WriteString(w, `{"access_token":"acc","expires_in":300}`)
+			return
 		}
+		if req.Header.Get("Authorization") != "Bearer acc" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="http://`+req.Host+`/token",service="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, "{}")
+	}))
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+	rm := remote{host: host, repo: "team/app", registry: host}
+	login := func(token string) (*http.Response, error) {
+		u := newUpstream(func(context.Context, string) (Credential, error) {
+			return Credential{Username: "ignored", Password: "ignored", IdentityToken: token}, nil
+		})
+		return u.registryDo(context.Background(), http.MethodGet, rm.url("http", "manifests", "v1"), nil, rm)
+	}
+
+	resp, err := login("rt-good")
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	mu.Lock()
+	want := map[string]string{"grant_type": "refresh_token", "refresh_token": "rt-good", "service": "test", "scope": "repository:team/app:pull", "client_id": "justpull"}
+	for k, v := range want {
+		if form[k] != v {
+			t.Errorf("form %s = %q, want %q", k, form[k], v)
+		}
+	}
+	if method != http.MethodPost || contentType != "application/x-www-form-urlencoded" {
+		t.Errorf("token request %s %q, want a form POST", method, contentType)
+	}
+	mu.Unlock()
+
+	_, err = login("rt-revoked")
+	if !isPermanent(err) || !strings.Contains(err.Error(), "refused the login") {
+		t.Fatalf("err = %v, want a permanent refused login", err)
+	}
+	if strings.Contains(err.Error(), "rt-revoked") {
+		t.Fatal("the error carries the identity token")
 	}
 }
 

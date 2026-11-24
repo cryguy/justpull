@@ -55,6 +55,17 @@ reports inside it. Call `cache.Sweep()` periodically (for example hourly) in a
 long-running process: `Pull` sweeps when it starts, but files of a cancelled
 pull should also go when no new pull comes.
 
+For private registries, set `Options.Credentials`. It gets the registry as the
+reference names it (`docker.io`, `ghcr.io`, `localhost:5000`) and returns a
+`Credential`, a username and password or an identity token, as `docker login`
+stores them:
+
+```go
+justpull.Options{Credentials: func(ctx context.Context, registry string) (justpull.Credential, error) {
+	return lookupLogin(registry) // a zero Credential pulls anonymously
+}}
+```
+
 ## Behaviour
 
 - **Resume.** Each layer is written to `<dir>/blobs/sha256/<hex>.partial` as it
@@ -86,8 +97,13 @@ pull should also go when no new pull comes.
   deletes files not written for 24 hours (`Options.MaxAge`).
 - **Disk.** While a pull runs, the image's compressed layers are on disk twice:
   in the cache and in Docker.
-- **Auth.** Anonymous pulls only: a bearer token is fetched when a registry
-  challenges, as dockerd does without credentials.
+- **Auth.** `Options.Credentials` is asked only when a registry answers `401`
+  with a challenge. A Basic challenge gets the username and password; a bearer
+  challenge gets a token, fetched with the username and password or exchanged
+  for the identity token (an OAuth2 refresh token), or anonymous without a
+  login, as dockerd does. A login is never sent to a storage host, nor over
+  plain HTTP to anything but loopback. A refused login, or a registry that
+  still refuses the image, fails the pull at once with the registry's answer.
 - **Transport.** HTTP/1.1, so each layer has its own connection and a retry
   never rides a stuck one. Registries on loopback are plain HTTP, all others
   HTTPS. `HTTPS_PROXY` and `NO_PROXY` are honoured.
@@ -105,7 +121,8 @@ go test -race ./...
 ```
 
 The tests need neither Docker nor the network. `internal/fakereg` is an
-in-process registry with expiring tokens, storage redirects with expiring
+in-process registry with expiring tokens, an optional login (Basic, or for the
+token with a password or a refresh token), storage redirects with expiring
 links, and scripted faults per blob request (cut, reset, stall, corruption,
 ignored `Range`, wrong start offset, `401` without a challenge). A fake Docker
 pulls through the proxy the way dockerd does, including skipping manifests and

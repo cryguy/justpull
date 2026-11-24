@@ -1,6 +1,7 @@
 // Package fakereg is an in-process OCI registry for tests: images with
-// random layers, optional bearer auth, optional redirects to a separate
-// storage host whose links expire, and scripted faults on blob GETs.
+// random layers, optional bearer auth, an optional login (basic, or for the
+// token), optional redirects to a separate storage host whose links expire,
+// and scripted faults on blob GETs.
 package fakereg
 
 import (
@@ -90,6 +91,14 @@ type Registry struct {
 	// LinkTTL (forever when zero).
 	Redirect bool
 	LinkTTL  time.Duration
+	// Username and Password, when set, make the registry private. With
+	// TokenTTL a token GET must carry them as Basic auth; without it the
+	// registry itself challenges for Basic auth on every request.
+	Username string
+	Password string
+	// RefreshToken, when set, is exchanged for a token by a POST with
+	// grant_type=refresh_token.
+	RefreshToken string
 
 	t       testing.TB
 	srv     *httptest.Server
@@ -200,20 +209,38 @@ func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 
 	if req.URL.Path == "/token" {
 		entry.Host = "token"
+		field := "token"
+		if req.Method == http.MethodPost {
+			field = "access_token"
+			if r.RefreshToken == "" || req.PostFormValue("grant_type") != "refresh_token" || req.PostFormValue("refresh_token") != r.RefreshToken {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+		} else if r.Username != "" && !r.loggedIn(req) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		tok := fmt.Sprintf("tok-%d", time.Now().UnixNano())
 		r.mu.Lock()
 		r.tokens[tok] = time.Now().Add(r.TokenTTL)
 		r.mu.Unlock()
-		fmt.Fprintf(w, `{"token":%q}`, tok)
+		fmt.Fprintf(w, `{%q:%q}`, field, tok)
 		return
 	}
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
-	if r.TokenTTL > 0 {
+	switch {
+	case r.TokenTTL > 0:
 		r.mu.Lock()
 		exp, ok := r.tokens[strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")]
 		r.mu.Unlock()
 		if !ok || time.Now().After(exp) {
 			w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="%s/token",service="fakereg"`, r.srv.URL))
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+	case r.Username != "":
+		if !r.loggedIn(req) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="fakereg"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -268,6 +295,11 @@ func (r *Registry) serveRegistry(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	http.NotFound(w, req)
+}
+
+func (r *Registry) loggedIn(req *http.Request) bool {
+	user, pass, ok := req.BasicAuth()
+	return ok && user == r.Username && pass == r.Password
 }
 
 func (r *Registry) serveStorage(w http.ResponseWriter, req *http.Request) {

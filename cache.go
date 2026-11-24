@@ -43,6 +43,12 @@ type Options struct {
 	// Logger receives warnings that do not fail a pull. Nil means
 	// slog.Default().
 	Logger *slog.Logger
+	// Credentials returns the login for a registry, named as in image
+	// references: docker.io for Docker Hub, ghcr.io, localhost:5000,
+	// 127.0.0.1:5000. It is called only when a registry answers 401 with a
+	// challenge, and may be called concurrently. A zero Credential means
+	// anonymous; nil means every pull is anonymous.
+	Credentials func(ctx context.Context, registry string) (Credential, error)
 }
 
 // Cache stores blobs on disk by digest and pulls images through them, so a
@@ -93,7 +99,7 @@ func New(dir string, opts Options) (*Cache, error) {
 		idleTimeout: defaultIdleTimeout,
 		retryBase:   defaultRetryBase,
 		retryMax:    defaultRetryMax,
-		up:          newUpstream(),
+		up:          newUpstream(opts.Credentials),
 		blobs:       map[string]*blob{},
 	}, nil
 }

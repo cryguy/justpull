@@ -19,15 +19,17 @@ const maxRedirects = 5
 // remote is one repository on a registry, addressed by its API host
 // (registry-1.docker.io for Docker Hub).
 type remote struct {
-	host string
-	repo string
+	host     string
+	repo     string
+	registry string // as image references name it (docker.io for Docker Hub)
 }
 
-// upstream talks to registries the way dockerd does for an anonymous pull:
-// bearer tokens on challenge, redirects to presigned storage URLs.
+// upstream talks to registries the way dockerd does for a pull: a login or
+// an anonymous token on challenge, redirects to presigned storage URLs.
 type upstream struct {
 	client      *http.Client // never follows redirects; openBlob does
 	tokenClient *http.Client
+	credentials func(ctx context.Context, registry string) (Credential, error)
 
 	mu     sync.Mutex
 	tokens map[string]string // "<host>/<repo>" -> Authorization value
@@ -37,7 +39,7 @@ type upstream struct {
 // layer then has its own connection, so closing a stuck body drops that
 // connection and the retry dials a fresh one; over HTTP/2 the retry would
 // share the stuck connection with every other layer.
-func newUpstream() *upstream {
+func newUpstream(credentials func(ctx context.Context, registry string) (Credential, error)) *upstream {
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -54,6 +56,7 @@ func newUpstream() *upstream {
 			},
 		},
 		tokenClient: &http.Client{Transport: transport, Timeout: 30 * time.Second},
+		credentials: credentials,
 		tokens:      map[string]string{},
 	}
 }
@@ -62,10 +65,11 @@ func (r remote) url(scheme, kind, ref string) string {
 	return scheme + "://" + r.host + "/v2/" + r.repo + "/" + kind + "/" + ref
 }
 
-// registryDo sends one request to the registry, fetching a token and
-// retrying once when the registry answers 401 with a bearer challenge. A 401
-// without one (an upstream that refused credentials, such as a proxy's
-// DENIED) comes back as is.
+// registryDo sends one request to the registry and, when it answers 401
+// with a challenge, logs in and sends it once more: a token for a bearer
+// challenge, the username and password themselves for a basic one. A 401
+// it cannot answer comes back as is: no challenge (an upstream that refused
+// credentials, such as a proxy's DENIED), or a basic challenge with no login.
 func (u *upstream) registryDo(ctx context.Context, method, rawURL string, header http.Header, r remote) (*http.Response, error) {
 	key := r.host + "/" + r.repo
 	send := func() (*http.Response, error) {
@@ -91,39 +95,68 @@ func (u *upstream) registryDo(ctx context.Context, method, rawURL string, header
 	if err != nil || resp.StatusCode != http.StatusUnauthorized {
 		return resp, err
 	}
-	ch, ok := parseBearerChallenge(resp.Header.Get("WWW-Authenticate"))
-	if !ok {
+	scheme, params := parseChallenge(resp.Header.Get("WWW-Authenticate"))
+	var auth, basicUser string
+	switch {
+	case scheme == "bearer" && params["realm"] != "":
+		drain(resp)
+		cred, err := u.credential(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		ch := challenge{realm: params["realm"], service: params["service"], scope: params["scope"]}
+		token, err := u.token(ctx, ch, r, cred)
+		if err != nil {
+			return nil, err
+		}
+		auth = "Bearer " + token
+	case scheme == "basic":
+		cred, err := u.credential(ctx, r)
+		if err != nil {
+			drain(resp)
+			return nil, err
+		}
+		if cred.Username == "" {
+			return resp, nil
+		}
+		drain(resp)
+		if err := checkLoginURL(r.registry, resp.Request.URL); err != nil {
+			return nil, err
+		}
+		auth, basicUser = basicAuth(cred.Username, cred.Password), cred.Username
+	default:
 		return resp, nil
 	}
-	drain(resp)
-	token, err := u.token(ctx, ch, r.repo)
-	if err != nil {
-		return nil, err
-	}
 	u.mu.Lock()
-	u.tokens[key] = "Bearer " + token
+	u.tokens[key] = auth
 	u.mu.Unlock()
-	return send()
+
+	resp, err = send()
+	if err != nil || resp.StatusCode != http.StatusUnauthorized || basicUser == "" {
+		return resp, err
+	}
+	drain(resp)
+	return nil, permanent(fmt.Errorf("registry %s refused the login for %s: %s", r.registry, basicUser, resp.Status))
 }
 
-// token runs the anonymous token exchange named by a bearer challenge.
-func (u *upstream) token(ctx context.Context, ch challenge, repo string) (string, error) {
+// token runs the token exchange a bearer challenge names: an OAuth2
+// refresh grant for an identity token, Basic auth for a username, or
+// anonymous.
+func (u *upstream) token(ctx context.Context, ch challenge, r remote, cred Credential) (string, error) {
 	endpoint, err := url.Parse(ch.realm)
 	if err != nil {
 		return "", permanent(fmt.Errorf("token realm %q: %w", ch.realm, err))
 	}
-	q := endpoint.Query()
-	if ch.service != "" {
-		q.Set("service", ch.service)
-	}
 	scope := ch.scope
 	if scope == "" {
-		scope = "repository:" + repo + ":pull"
+		scope = "repository:" + r.repo + ":pull"
 	}
-	q.Set("scope", scope)
-	endpoint.RawQuery = q.Encode()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if cred.IdentityToken != "" || cred.Username != "" {
+		if err := checkLoginURL(r.registry, endpoint); err != nil {
+			return "", err
+		}
+	}
+	req, err := tokenRequest(ctx, endpoint, ch.service, scope, cred)
 	if err != nil {
 		return "", permanent(err)
 	}
@@ -132,9 +165,16 @@ func (u *upstream) token(ctx context.Context, ch challenge, repo string) (string
 		return "", fmt.Errorf("token request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	refused := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return "", permanent(fmt.Errorf("token request: %s", resp.Status))
+	// OAuth2 answers an expired or revoked refresh token with 400
+	// invalid_grant.
+	case cred.IdentityToken != "" && (refused || resp.StatusCode == http.StatusBadRequest):
+		return "", permanent(fmt.Errorf("registry %s refused the login with the identity token: %s", r.registry, resp.Status))
+	case cred.Username != "" && refused:
+		return "", permanent(fmt.Errorf("registry %s refused the login for %s: %s", r.registry, cred.Username, resp.Status))
+	case refused:
+		return "", permanent(fmt.Errorf("registry %s refused access to %s: %s", r.registry, r.repo, resp.Status))
 	case resp.StatusCode != http.StatusOK:
 		return "", fmt.Errorf("token request: %s", resp.Status)
 	}
@@ -152,6 +192,40 @@ func (u *upstream) token(ctx context.Context, ch challenge, repo string) (string
 		return body.AccessToken, nil
 	}
 	return "", fmt.Errorf("token response has no token")
+}
+
+func tokenRequest(ctx context.Context, endpoint *url.URL, service, scope string, cred Credential) (*http.Request, error) {
+	if cred.IdentityToken != "" {
+		form := url.Values{}
+		form.Set("grant_type", "refresh_token")
+		form.Set("refresh_token", cred.IdentityToken)
+		if service != "" {
+			form.Set("service", service)
+		}
+		form.Set("scope", scope)
+		form.Set("client_id", "justpull")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), strings.NewReader(form.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		return req, nil
+	}
+	q := endpoint.Query()
+	if service != "" {
+		q.Set("service", service)
+	}
+	q.Set("scope", scope)
+	get := *endpoint
+	get.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, get.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	if cred.Username != "" {
+		req.SetBasicAuth(cred.Username, cred.Password)
+	}
+	return req, nil
 }
 
 // manifest fetches a manifest, retrying network errors and 5xx a few times.
@@ -297,17 +371,12 @@ type challenge struct {
 	realm, service, scope string
 }
 
-// parseBearerChallenge reads `Bearer realm="...",service="...",scope="..."`.
-func parseBearerChallenge(h string) (challenge, bool) {
-	scheme, rest, _ := strings.Cut(strings.TrimSpace(h), " ")
-	if !strings.EqualFold(scheme, "bearer") {
-		return challenge{}, false
-	}
-	params := parseAuthParams(rest)
-	if params["realm"] == "" {
-		return challenge{}, false
-	}
-	return challenge{realm: params["realm"], service: params["service"], scope: params["scope"]}, true
+// parseChallenge reads a WWW-Authenticate value such as
+// `Bearer realm="...",service="...",scope="..."` into its scheme, in lower
+// case, and its parameters.
+func parseChallenge(h string) (scheme string, params map[string]string) {
+	s, rest, _ := strings.Cut(strings.TrimSpace(h), " ")
+	return strings.ToLower(s), parseAuthParams(rest)
 }
 
 func parseAuthParams(s string) map[string]string {

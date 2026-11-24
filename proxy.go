@@ -85,6 +85,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *proxy) manifest(w http.ResponseWriter, r *http.Request, ref string) {
 	resp, err := p.c.up.manifest(r.Context(), p.t.scheme, r.Method, p.t.remote, ref, r.Header.Values("Accept"))
 	if err != nil {
+		if isPermanent(err) {
+			p.fail(err)
+		}
 		writeError(w, http.StatusBadGateway, "UNKNOWN", "registry unreachable: "+err.Error())
 		return
 	}
@@ -94,7 +97,11 @@ func (p *proxy) manifest(w http.ResponseWriter, r *http.Request, ref string) {
 			w.Header().Set(k, v)
 		}
 	}
+	refused := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
 	if r.Method == http.MethodHead {
+		if refused {
+			p.refuse(resp.Status, nil)
+		}
 		if v := resp.Header.Get("Content-Length"); v != "" {
 			w.Header().Set("Content-Length", v)
 		}
@@ -117,12 +124,26 @@ func (p *proxy) manifest(w http.ResponseWriter, r *http.Request, ref string) {
 		writeError(w, http.StatusBadGateway, "UNKNOWN", "manifest larger than 4 MiB")
 		return
 	}
+	if refused {
+		p.refuse(resp.Status, body)
+	}
 	if resp.StatusCode == http.StatusOK {
 		p.recordManifest(p.c.saveManifest(body), body, 0)
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(body)
+}
+
+// refuse fails the pull with the registry's refusal of the manifest, which
+// registryDo could not answer with a login. It must run before the status
+// is relayed: Pull reports this cause only if it is set when Docker gives up.
+func (p *proxy) refuse(status string, body []byte) {
+	msg := strings.TrimSpace(string(body[:min(len(body), 512)]))
+	if msg != "" {
+		msg = ": " + msg
+	}
+	p.fail(permanent(fmt.Errorf("registry %s refused access to %s: %s%s", p.t.remote.registry, p.t.path, status, msg)))
 }
 
 // recordManifest notes a manifest as part of this pull's image along with
