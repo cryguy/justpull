@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -307,6 +308,36 @@ func TestPermanentErrorFailsAtOnce(t *testing.T) {
 	}
 	if took := time.Since(start); took > time.Second || len(f.asked()) != 1 {
 		t.Fatalf("took %s over %d attempts; a permanent error must not be retried", took, len(f.asked()))
+	}
+}
+
+func TestFailureIsReportedBeforeReadersSeeIt(t *testing.T) {
+	c := newTestCache(t, 5*time.Second)
+	_, digest := randomBlob(t, 1000)
+	f := &fakeFetch{attempt: func(int, int64) (io.ReadCloser, int64, int64, error) {
+		return nil, 0, 0, permanent(errors.New("registry answered 404 Not Found"))
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b := mustAcquire(t, c, digest, 1000)
+	defer c.release(b)
+
+	var reported atomic.Bool
+	var wg sync.WaitGroup
+	c.ensureDownload(ctx, b, f.fetch, func(error) {
+		// A slow report: a reader woken before it ends would see the
+		// failure while its cause is still unset.
+		time.Sleep(50 * time.Millisecond)
+		reported.Store(true)
+	}, &wg)
+	err := b.serve(ctx, io.Discard, func() {}, 0, 999)
+	reportedFirst := reported.Load()
+	wg.Wait()
+	if err == nil {
+		t.Fatal("serve succeeded; want the layer's failure")
+	}
+	if !reportedFirst {
+		t.Fatal("a reader saw the failure before it was reported")
 	}
 }
 

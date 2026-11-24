@@ -220,6 +220,12 @@ func (c *Cache) ensureDownload(ctx context.Context, b *blob, fetch fetchFunc, on
 	go func() {
 		defer wg.Done()
 		err := c.fill(ctx, b, fetch)
+		// Reported before readers are woken: a reader that fails ends its
+		// client's request, and the client's caller must find the cause
+		// already set when it looks.
+		if err != nil && ctx.Err() == nil {
+			onFail(fmt.Errorf("layer sha256:%s: %w", b.hex[:12], err))
+		}
 		c.mu.Lock()
 		b.mu.Lock()
 		b.running = false
@@ -232,9 +238,6 @@ func (c *Cache) ensureDownload(ctx context.Context, b *blob, fetch fetchFunc, on
 		}
 		b.mu.Unlock()
 		c.mu.Unlock()
-		if err != nil && ctx.Err() == nil {
-			onFail(fmt.Errorf("layer sha256:%s: %w", b.hex[:12], err))
-		}
 	}()
 }
 
